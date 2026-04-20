@@ -1,0 +1,2 @@
+"""Sentinel missile simulation package."""
+

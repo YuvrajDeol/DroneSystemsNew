@@ -1,0 +1,36 @@
+sim:
+  dt_s: 0.01
+  duration_s: 90.0
+  speed_of_sound_mps: 340.29
+
+missile:
+  mass_kg: 100.0
+  max_accel_mps2: 30.0
+  init_position_m: [-20000.0, 5.0]
+  init_velocity_mps: [850.0, 0.0]
+  air_density_kgpm3: 1.225
+  drag_area_m2: 0.003
+  cruise_speed_mps: 850.0
+  speed_hold_kp: 0.2
+  max_thrust_n: 4000.0
+
+target:
+  init_position_m: [0.0, 0.0]
+  init_velocity_mps: [0.0, 0.0]
+
+guidance:
+  cruise_alt_m: 5.0
+  terminal_range_m: 5000.0
+  popup_alt_m: 150.0
+  max_accel_mps2: 30.0
+  max_vz_cmd_mps: 25.0
+  alt_to_vz_gain: 1.2
+  vz_kp: 6.0
+  vz_ki: 1.0
+  vz_kd: 1.0
+  dive_nav_gain: 1.2
+
+output:
+  out_dir: "data/processed"
+  csv_name: "sim_log.csv"
+

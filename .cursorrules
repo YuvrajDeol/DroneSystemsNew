@@ -1,0 +1,7 @@
+You are working in a Python simulation project.
+
+- Prefer small, testable functions.
+- Keep simulation state explicit and immutable where practical.
+- Avoid heavyweight frameworks unless requested.
+- Use type hints for public APIs.
+
