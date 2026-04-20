@@ -42,7 +42,7 @@ def main() -> int:
         vz_kp=float(cfg["guidance"]["vz_kp"]),
         vz_ki=float(cfg["guidance"]["vz_ki"]),
         vz_kd=float(cfg["guidance"]["vz_kd"]),
-        dive_nav_gain=float(cfg["guidance"]["dive_nav_gain"]),
+        N_gain=float(cfg["guidance"]["dive_nav_gain"]),
     )
 
     m_state = MissileState(
@@ -79,6 +79,13 @@ def main() -> int:
             position_m=position_m,
             velocity_mps=velocity_mps,
         )
+
+        if m_state.position_m[1] <= 0.0:
+            miss_distance_m = abs(float(t_pos[0] - m_state.position_m[0]))
+            print(f"Impact! Simulation terminated at t={t_s:.2f}s")
+            print(f"Final Miss Distance: {miss_distance_m:.2f} meters")
+            break
+
         t_pos = t_pos + t_vel * dt_s
 
         miss_distance_m = float(np.linalg.norm(t_pos - m_state.position_m))

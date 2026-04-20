@@ -16,7 +16,7 @@ class SeaSkimGuidance:
     """
 
     cruise_alt_m: float = 5.0
-    terminal_range_m: float = 5000.0
+    terminal_range_m: float = 15000.0
     popup_alt_m: float = 150.0
     max_accel_mps2: float = 30.0
     max_vz_cmd_mps: float = 25.0
@@ -24,7 +24,7 @@ class SeaSkimGuidance:
     vz_kp: float = 2.4
     vz_ki: float = 0.35
     vz_kd: float = 0.4
-    dive_nav_gain: float = 1.2
+    N_gain: float = 3.0
 
     phase: str = "cruise"
     _vz_err_int: float = 0.0
@@ -50,10 +50,10 @@ class SeaSkimGuidance:
         target_vel_mps: np.ndarray,
         dt_s: float,
     ) -> np.ndarray:
-        del target_vel_mps
         m_p = np.asarray(missile_pos_m, dtype=float).reshape(2)  # [x, z]
         m_v = np.asarray(missile_vel_mps, dtype=float).reshape(2)  # [vx, vz]
         t_p = np.asarray(target_pos_m, dtype=float).reshape(2)  # [x, z]
+        t_v = np.asarray(target_vel_mps, dtype=float).reshape(2)  # [vx, vz]
 
         rel = t_p - m_p
         range_m = float(np.linalg.norm(rel))
@@ -63,12 +63,14 @@ class SeaSkimGuidance:
             self._vz_err_int = 0.0
             self._prev_vz_err = 0.0
 
+        # TODO: Implement 3-State Kalman Filter for Radar Altimeter wave noise rejection.
         if self.phase == "popup" and m_p[1] >= self.popup_alt_m - 0.1:
             self.phase = "dive"
             self._vz_err_int = 0.0
             self._prev_vz_err = 0.0
 
         if self.phase == "cruise":
+            # TODO: Implement 3-State Kalman Filter for Radar Altimeter wave noise rejection.
             alt_err_m = self.cruise_alt_m - m_p[1]
             vz_target = float(
                 np.clip(
@@ -80,6 +82,7 @@ class SeaSkimGuidance:
             az_cmd = self._vz_pid(vz_target, m_v[1], dt_s)
             ax_cmd = 0.0
         elif self.phase == "popup":
+            # TODO: Implement 3-State Kalman Filter for Radar Altimeter wave noise rejection.
             alt_err_m = self.popup_alt_m - m_p[1]
             vz_target = float(
                 np.clip(
@@ -91,13 +94,21 @@ class SeaSkimGuidance:
             az_cmd = self._vz_pid(vz_target, m_v[1], dt_s)
             ax_cmd = 0.0
         else:  # dive
-            rel_norm = float(np.linalg.norm(rel))
-            if rel_norm < 1e-6:
+            rel_p = t_p - m_p
+            rel_v = t_v - m_v
+            R = float(np.linalg.norm(rel_p))
+            if R < 1e-6:
                 return np.zeros(2, dtype=float)
-            rel_hat = rel / rel_norm
-            desired_vel = rel_hat * max(50.0, float(np.linalg.norm(m_v)))
-            vel_err = desired_vel - m_v
-            accel_vec = self.dive_nav_gain * vel_err
+
+            V_c = -float(np.dot(rel_p, rel_v)) / R
+            lambda_dot = (rel_p[0] * rel_v[1] - rel_p[1] * rel_v[0]) / max(R * R, 1e-6)
+            a_n = self.N_gain * V_c * lambda_dot
+
+            speed = float(np.linalg.norm(m_v))
+            if speed < 1e-6:
+                return np.zeros(2, dtype=float)
+            n_hat = np.array([-m_v[1], m_v[0]], dtype=float) / speed
+            accel_vec = a_n * n_hat
             ax_cmd = float(accel_vec[0])
             az_cmd = float(accel_vec[1])
 
