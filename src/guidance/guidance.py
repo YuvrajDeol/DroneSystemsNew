@@ -25,6 +25,7 @@ class SeaSkimGuidance:
     vz_ki: float = 0.35
     vz_kd: float = 0.4
     N_gain: float = 3.0
+    cruise_only: bool = False
 
     phase: str = "cruise"
     _vz_err_int: float = 0.0
@@ -58,16 +59,18 @@ class SeaSkimGuidance:
         rel = t_p - m_p
         range_m = float(np.linalg.norm(rel))
 
-        if self.phase == "cruise" and range_m < self.terminal_range_m:
-            self.phase = "popup"
-            self._vz_err_int = 0.0
-            self._prev_vz_err = 0.0
+        # --- Terminal phase transitions (disabled when cruise_only=True) ---
+        if not self.cruise_only:
+            if self.phase == "cruise" and range_m < self.terminal_range_m:
+                self.phase = "popup"
+                self._vz_err_int = 0.0
+                self._prev_vz_err = 0.0
 
-        # TODO: Implement 3-State Kalman Filter for Radar Altimeter wave noise rejection.
-        if self.phase == "popup" and m_p[1] >= self.popup_alt_m - 0.1:
-            self.phase = "dive"
-            self._vz_err_int = 0.0
-            self._prev_vz_err = 0.0
+            # TODO: Implement 3-State Kalman Filter for Radar Altimeter wave noise rejection.
+            if self.phase == "popup" and m_p[1] >= self.popup_alt_m - 0.1:
+                self.phase = "dive"
+                self._vz_err_int = 0.0
+                self._prev_vz_err = 0.0
 
         if self.phase == "cruise":
             # TODO: Implement 3-State Kalman Filter for Radar Altimeter wave noise rejection.
