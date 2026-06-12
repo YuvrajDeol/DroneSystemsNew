@@ -36,7 +36,14 @@ KNOWN_LIMITATIONS: str = """\
   resolution cells contain fewer scatterers → spikier clutter → smaller ν.
   The tabulated ν values are optimistic upper bounds.
 - B gradient values are approximated; exact values require reading Figures
-  9/10 of Ritchie et al. directly.
+  9/10 of Ritchie et al. directly.  The intensity-dependent Doppler
+  centroid (m_f = CoG + B·x̄) is used in the analytical PSD model but
+  NOT in speckle colouring — speckle is shaped with the base CoG/σ_PSD
+  applied uniformly across range bins.
+- Speckle is coloured in slow-time to a Gaussian Doppler PSD (width
+  σ_PSD, centroid CoG).  A single symmetric Gaussian is assumed; the
+  asymmetric/bimodal (Bragg + fast-scatterer) structure seen at low
+  grazing angle is not modelled.
 - Bistatic Doppler correction uses cos(β/2) approximation (broadside
   geometry).
 - VV polarization parameters are available but not primary for SENTINEL
@@ -251,27 +258,60 @@ class BistaticClutterModel:
     # ── speckle generation ────────────────────────────────────────────
 
     def generate_speckle(self) -> np.ndarray:
-        """Generate i.i.d. complex Gaussian speckle.
+        """Generate complex Gaussian speckle with the sea-clutter Doppler PSD.
 
-        At 77 GHz the speckle decorrelation time (≈ 1.27 ms) is shorter
-        than one PRI at typical drone PRFs (1–10 kHz), so speckle is
-        modelled as independent between pulses.
+        White i.i.d. speckle would give a *flat* (white) Doppler
+        spectrum, which is unphysical: real sea clutter has a finite
+        spectral width centred near the surface-motion Doppler.  Here
+        the speckle is **coloured in slow-time** so its power spectral
+        density matches the model Gaussian PSD:
 
-        Each sample is drawn from CN(0, 1):
-            w = (randn + j·randn) / √2
+            S(f) = exp(−(f − CoG)² / (2 σ_PSD²))
 
-        so that E[|w|²] = 1  (unit mean power).
+        Method (standard spectral-shaping of Gaussian noise):
+        1. Draw white CN(0,1) noise of shape ``(n_range, n_pulse)``.
+        2. FFT along the pulse (slow-time) axis.
+        3. Multiply by the filter ``H(f) = √S(f)`` evaluated on the
+           ``fftfreq`` grid (CoG and σ_PSD from the geometry).
+        4. Inverse-FFT back to slow-time.
+        5. Renormalise to exactly unit mean power, E[|w|²] = 1.
+
+        Filtering a Gaussian process by a linear filter keeps it
+        circularly-symmetric complex Gaussian, so the K-distribution
+        amplitude statistics (texture × speckle) are preserved while
+        the clutter gains a realistic Doppler centroid and roll-off.
 
         Returns
         -------
         np.ndarray, shape ``(n_range_bins, cpi_pulses)``
-            Complex array with unit mean power per cell.
+            Complex speckle, coloured along the pulse axis, unit mean
+            power per realisation.
         """
         shape = (self.n_range_bins, self.cpi_pulses)
-        return (
+        white = (
             self._rng.standard_normal(shape)
             + 1j * self._rng.standard_normal(shape)
         ) / np.sqrt(2.0)
+
+        # No Doppler dimension to shape (single-pulse CPI).
+        if self.cpi_pulses < 2:
+            return white
+
+        f = np.fft.fftfreq(self.cpi_pulses, d=1.0 / self.prf_hz)
+        sigma = max(self._params["sigma_psd_hz"], 1e-6)
+        cog = self._params["cog_hz"]
+
+        # Slow-time shaping filter H(f) = √S(f).  Doppler wrap (energy
+        # beyond ±PRF/2 folding back) is physical aliasing, left as-is.
+        h = np.exp(-((f - cog) ** 2) / (4.0 * sigma ** 2))
+
+        spectrum = np.fft.fft(white, axis=1) * h[np.newaxis, :]
+        speckle = np.fft.ifft(spectrum, axis=1)
+
+        # Exact unit mean power (the colouring filter changes total
+        # power; renormalise per realisation so CNR stays calibrated).
+        speckle /= np.sqrt(np.mean(np.abs(speckle) ** 2))
+        return speckle
 
     # ── clutter voltage (compound K-distribution) ─────────────────────
 
@@ -551,22 +591,30 @@ class BistaticClutterModel:
         ax.legend()
         ax.set_xlim(0, a_max)
 
-        # ---- Bottom-left: single range-bin PSD vs Gaussian model ----
+        # ---- Bottom-left: measured Doppler PSD vs Gaussian model ----
+        # Average the periodogram over all range bins for a smooth PSD
+        # estimate, then overlay the model PSD.  Both are normalised to
+        # a 0 dB peak so the comparison is of *shape*, not absolute
+        # level (the two quantities carry different units).
         ax = axes[1, 0]
-        ref_bin = 0
-        psd_fft = power_db[ref_bin, :]
-        f_model, G_model = self.generate_doppler_psd(texture[ref_bin, :])
+        psd_meas = np.mean(power_lin, axis=0)           # avg over range bins
+        psd_meas_db = 10.0 * np.log10(np.maximum(psd_meas, 1e-30))
+        psd_meas_db -= psd_meas_db.max()                # peak → 0 dB
+
+        f_model, G_model = self.generate_doppler_psd(texture[:, 0])
         G_model_db = 10.0 * np.log10(np.maximum(G_model, 1e-30))
+        G_model_db -= G_model_db.max()                  # peak → 0 dB
 
         sort_idx = np.argsort(doppler_axis)
-        ax.plot(doppler_axis[sort_idx], psd_fft[sort_idx],
-                alpha=0.7, label="FFT PSD (bin 0)")
+        ax.plot(doppler_axis[sort_idx], psd_meas_db[sort_idx],
+                alpha=0.8, label="Measured PSD (range-avg)")
         sort_m = np.argsort(f_model)
         ax.plot(f_model[sort_m], G_model_db[sort_m], "r--", lw=2,
                 label="Gaussian model")
         ax.set_xlabel("Doppler (Hz)")
-        ax.set_ylabel("Power (dB)")
-        ax.set_title("PSD: FFT vs Gaussian Model")
+        ax.set_ylabel("Normalised power (dB)")
+        ax.set_ylim(-25, 2)
+        ax.set_title("Doppler PSD: measured vs model (peak-normalised)")
         ax.legend()
 
         # ---- Bottom-right: texture marginal across range bins ----

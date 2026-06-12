@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import os
 import random
 from pathlib import Path
@@ -23,6 +24,25 @@ def _mach_to_mps(mach: float, speed_of_sound_mps: float) -> float:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Generate randomized cruise-only missile trajectories."
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="RNG seed for reproducible parameter randomization "
+             "(default 42). Re-running with the same seed reproduces "
+             "the exact same set of trajectory files.",
+    )
+    parser.add_argument(
+        "--runs", type=int, default=20, help="Number of runs (default 20).",
+    )
+    args = parser.parse_args()
+
+    # Seed so trajectory filenames and contents are reproducible — an
+    # unseeded run produces differently-named files that accumulate in
+    # logs/ instead of overwriting the previous set.
+    random.seed(args.seed)
+
     root = Path(__file__).resolve().parent
     cfg = _load_config(root / "config" / "sim_config.yaml")
 
@@ -39,7 +59,7 @@ def main() -> int:
     logs_dir = root / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
 
-    num_runs = 20
+    num_runs = args.runs
     generated_files: list[str] = []
 
     for run_id in range(1, num_runs + 1):

@@ -155,6 +155,46 @@ def test_speckle_power(model_90: BistaticClutterModel) -> None:
     )
 
 
+# ── Test: speckle Doppler spectrum is shaped, not white ───────────────────
+
+def test_speckle_doppler_psd_matches_sigma() -> None:
+    """Coloured speckle must reproduce the model Doppler PSD width and
+    centroid, and must NOT be white.
+
+    Uses a narrow σ and CoG = 0 where Doppler wrap is negligible, so the
+    range-averaged periodogram's second moment cleanly recovers σ.  A
+    white spectrum over ±PRF/2 would give σ ≈ PRF/√12 ≈ 289 Hz — far
+    from the 60 Hz target — so the test also guards against regression
+    to white speckle.
+    """
+    model = BistaticClutterModel(
+        bistatic_angle_deg=90,
+        cnr_db=15.0,
+        n_range_bins=8192,
+        cpi_pulses=256,
+        prf_hz=1000,
+        seed=5,
+    )
+    # Override the PSD params to a clean, wrap-free test case.
+    model._params["sigma_psd_hz"] = 60.0
+    model._params["cog_hz"] = 0.0
+
+    speckle = model.generate_speckle()
+
+    # Range-averaged periodogram → smooth PSD estimate.
+    psd = np.mean(np.abs(np.fft.fft(speckle, axis=1)) ** 2, axis=0)
+    f = np.fft.fftfreq(model.cpi_pulses, d=1.0 / model.prf_hz)
+
+    centroid = float(np.sum(f * psd) / np.sum(psd))
+    width = float(np.sqrt(np.sum((f - centroid) ** 2 * psd) / np.sum(psd)))
+
+    assert abs(centroid) < 15.0, f"PSD centroid = {centroid:.1f} Hz, expected ≈ 0"
+    assert abs(width - 60.0) / 60.0 < 0.20, (
+        f"PSD width = {width:.1f} Hz, expected ≈ 60 Hz "
+        f"(white speckle would give ≈ 289 Hz)"
+    )
+
+
 # ── Test: shape parameter recovery ───────────────────────────────────────
 
 def test_shape_parameter_recovery() -> None:

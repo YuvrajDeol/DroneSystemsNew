@@ -11,20 +11,13 @@ clutter_diagnostics.png
 # gitlink — kept locally only, never tracked).
 sentinel-missile-sim/
 
-# Ignore all simulation outputs, but keep 2 samples under 100MB
-integrated_output/*
-!integrated_output/cruise_run_14_Alt_32.7m_Mach_3.40.npz
-!integrated_output/cruise_run_17_Alt_26.2m_Mach_3.34.npz
+# Generated simulation outputs (large, reproducible via the pipeline —
+# `python main.py --seed 42` then `python integrate_simulations.py --seed 42`).
+integrated_output/
 
-# Ignore all logs, but keep 3 sample txt logs
-logs/*
-!logs/cruise_run_01_Alt_53.4m_Mach_2.10.txt
-!logs/cruise_run_02_Alt_36.7m_Mach_1.31.txt
-!logs/cruise_run_03_Alt_46.0m_Mach_1.19.txt
+# Generated trajectory logs (reproducible via `python main.py --seed 42`).
+logs/
 
-# Ignore all training data, but keep metadata and 3 sample npz files
+# Generated training data, but keep the metadata index.
 sentinel_training_data/*
 !sentinel_training_data/metadata.csv
-!sentinel_training_data/sample_0000.npz
-!sentinel_training_data/sample_0001.npz
-!sentinel_training_data/sample_0002.npz
