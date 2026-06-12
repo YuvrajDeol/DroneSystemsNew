@@ -4,6 +4,12 @@ __pycache__/
 .DS_Store
 exports/
 exported_txt_1/
+evaluation/
+clutter_diagnostics.png
+
+# Stale embedded copy of an earlier project iteration (was a broken
+# gitlink — kept locally only, never tracked).
+sentinel-missile-sim/
 
 # Ignore all simulation outputs, but keep 2 samples under 100MB
 integrated_output/*

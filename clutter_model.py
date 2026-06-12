@@ -17,11 +17,12 @@ References
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from scipy import special
+from scipy import special, stats
 
 # ═══════════════════════════════════════════════════════════════════════════
 # KNOWN LIMITATIONS
@@ -40,6 +41,16 @@ KNOWN_LIMITATIONS: str = """\
   geometry).
 - VV polarization parameters are available but not primary for SENTINEL
   Mesh HH config.
+- Texture is i.i.d. across range bins: the sources confirm spatial
+  texture correlation exists but give no decorrelation lengths, so
+  spatial correlation is not modelled.
+- Across-CPI texture evolution uses a Gaussian-copula AR(1) process
+  with exp(−Δt/τ) correlation.  The ~3 s decorrelation time is
+  source-backed; the copula construction itself is a modelling choice
+  (the sources do not prescribe a correlated-Gamma algorithm).
+- Clutter power is range-independent (constant CNR across the swath).
+  A σ⁰-based range profile (GIT/TSC/Sittrop + range equation) is
+  pending.
 """
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -54,6 +65,11 @@ NETRAD_PARAMS_HH: dict[int, dict[str, float]] = {
 
 FREQ_SCALE: float = 77.0 / 2.45          # ≈ 31.43 — S-band → 77 GHz multiplier
 SPECKLE_DECORR_MS: float = 40.0 * (2.45 / 77.0)  # ≈ 1.27 ms at 77 GHz
+
+# Texture (gravity-wave / swell) decorrelation time.  Driven by the
+# physical ocean surface, NOT the carrier frequency — stays at "several
+# seconds" at 77 GHz even though speckle decorrelation scales with λ.
+TEXTURE_DECORR_S: float = 3.0
 
 # Anchor angles used for interpolation (sorted).
 _ANCHOR_ANGLES = sorted(NETRAD_PARAMS_HH.keys())  # [60, 90, 120]
@@ -125,6 +141,10 @@ class BistaticClutterModel:
         # Pre-compute empirical parameters for this geometry.
         self._params = self._get_empirical_params()
 
+        # Latent Gaussian state for across-CPI texture evolution
+        # (Gaussian-copula AR(1)).  None until the first texture draw.
+        self._texture_gauss: Optional[np.ndarray] = None
+
     # ── empirical parameter interpolation ─────────────────────────────
 
     def _get_empirical_params(self) -> dict[str, float]:
@@ -172,57 +192,61 @@ class BistaticClutterModel:
 
     # ── texture generation ────────────────────────────────────────────
 
-    def generate_texture(self) -> np.ndarray:
-        """Generate correlated texture envelope.
+    def generate_texture(
+        self, dt_since_last_s: Optional[float] = None
+    ) -> np.ndarray:
+        """Generate the Gamma texture envelope for one CPI.
 
-        Uses a moving-average approximation of an AR(1) Gamma process:
-        1. Draw i.i.d. samples from Gamma(shape=ν, scale=1/ν) so that
-           the marginal distribution has mean = 1.
-        2. Smooth with a moving-average kernel of width
-           ``int(τ_texture × PRF)`` to introduce temporal correlation
-           matching the ~3 s texture decorrelation time.
-        3. Re-normalise each range bin so that mean intensity = 1.
+        Physics (NetRAD / compound-K model):
 
-        **Approximation note:** A true AR(1) Gamma process is
-        non-trivial.  The moving-average approach preserves the correct
-        marginal mean and introduces realistic slowly-varying texture
-        but does not exactly reproduce the Gamma marginal distribution.
+        * Texture decorrelates over ~``TEXTURE_DECORR_S`` (several
+          seconds, set by gravity waves and swell), which is far longer
+          than one CPI (e.g. 128 ms).  It is therefore **constant
+          across the pulses of a single CPI** — one Gamma(ν, 1/ν) draw
+          per range bin, tiled along the pulse axis.
+        * Texture has unit *ensemble* mean (Gamma(ν, 1/ν) ⇒ E[x] = 1);
+          absolute clutter power is carried separately by the CNR / σ⁰
+          scaling.  No sample renormalisation is applied — that would
+          destroy the bin-to-bin Gamma variation that makes the
+          clutter K-distributed.
+        * Across consecutive CPIs the texture evolves with correlation
+          ``ρ = exp(−Δt/τ)`` via a Gaussian-copula AR(1): a latent
+          standard-normal state per bin is AR(1)-updated, then mapped
+          through Φ and the Gamma(ν, 1/ν) inverse CDF, preserving the
+          exact Gamma marginal at every step.
+
+        Parameters
+        ----------
+        dt_since_last_s : float or None
+            Time elapsed since the previous texture draw.  ``None``
+            (default) draws an independent texture (fresh scene).
+            A float evolves the previous texture forward by that many
+            seconds — use the CPI duration when generating consecutive
+            frames of an RD video.
 
         Returns
         -------
         np.ndarray, shape ``(n_range_bins, cpi_pulses)``
-            Strictly positive texture intensity values with mean ≈ 1.
+            Strictly positive texture, constant along axis 1,
+            Gamma(ν, 1/ν)-distributed along axis 0.
         """
         nu = self._params["nu"]
-        tau_texture_s = 3.0  # texture decorrelation time (seconds)
-        window = max(1, int(tau_texture_s * self.prf_hz))
 
-        # Number of raw samples needed so that *valid* convolution
-        # yields at least cpi_pulses outputs.
-        n_gen = window + self.cpi_pulses - 1
+        if dt_since_last_s is None or self._texture_gauss is None:
+            self._texture_gauss = self._rng.standard_normal(self.n_range_bins)
+        else:
+            rho = float(np.exp(-dt_since_last_s / TEXTURE_DECORR_S))
+            innovation = self._rng.standard_normal(self.n_range_bins)
+            self._texture_gauss = (
+                rho * self._texture_gauss
+                + np.sqrt(1.0 - rho * rho) * innovation
+            )
 
-        texture = np.empty((self.n_range_bins, self.cpi_pulses), dtype=float)
+        # Map latent Gaussian → uniform → Gamma(ν, 1/ν) marginal.
+        u = np.clip(special.ndtr(self._texture_gauss), 1e-12, 1.0 - 1e-12)
+        texture_bin = stats.gamma.ppf(u, a=nu, scale=1.0 / nu)
 
-        for r in range(self.n_range_bins):
-            # i.i.d. Gamma samples with mean = 1, variance = 1/ν.
-            raw = self._rng.gamma(shape=nu, scale=1.0 / nu, size=n_gen)
-
-            if window > 1:
-                kernel = np.ones(window) / window
-                smoothed = np.convolve(raw, kernel, mode="valid")
-                # np.convolve valid: len = n_gen - window + 1 = cpi_pulses
-                smoothed = smoothed[: self.cpi_pulses]
-            else:
-                smoothed = raw[: self.cpi_pulses]
-
-            # Re-normalise to mean = 1.
-            m = smoothed.mean()
-            if m > 0.0:
-                smoothed /= m
-
-            texture[r, :] = smoothed
-
-        return texture
+        return np.repeat(texture_bin[:, np.newaxis], self.cpi_pulses, axis=1)
 
     # ── speckle generation ────────────────────────────────────────────
 
@@ -251,7 +275,9 @@ class BistaticClutterModel:
 
     # ── clutter voltage (compound K-distribution) ─────────────────────
 
-    def generate_clutter_voltage(self) -> np.ndarray:
+    def generate_clutter_voltage(
+        self, dt_since_last_s: Optional[float] = None
+    ) -> np.ndarray:
         """Combine texture and speckle into complex clutter voltage.
 
         The compound K-distribution model produces clutter as:
@@ -261,6 +287,14 @@ class BistaticClutterModel:
         where ``clutter_power = noise_power × 10^(CNR_dB / 10)`` and
         ``noise_power = 1.0`` (normalised).
 
+        Parameters
+        ----------
+        dt_since_last_s : float or None
+            Forwarded to :meth:`generate_texture`.  ``None`` draws an
+            independent texture; a float evolves the previous texture
+            forward by that many seconds (use the CPI duration for
+            consecutive RD-video frames).
+
         Returns
         -------
         np.ndarray, shape ``(n_range_bins, cpi_pulses)``
@@ -269,7 +303,7 @@ class BistaticClutterModel:
         noise_power = 1.0
         clutter_power = noise_power * 10.0 ** (self.cnr_db / 10.0)
 
-        texture = self.generate_texture()
+        texture = self.generate_texture(dt_since_last_s=dt_since_last_s)
         speckle = self.generate_speckle()
 
         return np.sqrt(texture) * speckle * np.sqrt(clutter_power)
@@ -380,8 +414,13 @@ class BistaticClutterModel:
         Uses Method of Moments (MoM) with CNR-dependent gating to
         switch between estimators:
 
-        * **CNR > 12 dB:** standard MoM
-          ``ν = 1 / (MN2 − 1)``  where  ``MN2 = ⟨z²⟩ / ⟨z⟩²``
+        * **CNR > 12 dB:** standard MoM for full K-distributed
+          intensity (texture × speckle):
+          ``ν = 2 / (MN2 − 2)``  where  ``MN2 = ⟨z²⟩ / ⟨z⟩²``.
+          (NetRAD's ``ν = 1/(MN2 − 1)`` form applies to the Gamma
+          *texture* / local-mean intensity alone, not to the full
+          compound intensity, which carries the extra speckle moment
+          E[|w|⁴] = 2.)
         * **3 dB ≤ CNR ≤ 12 dB:** K+Noise estimator
           ``ν = 2·(M1 − P_N)² / (M2 − 2·M1²)``
         * **CNR < 3 dB:** clutter is below noise floor → return ``np.inf``
@@ -439,7 +478,7 @@ class BistaticClutterModel:
         - Top-left:     Range-Doppler power map (dB colormap)
         - Top-right:    Clutter amplitude histogram vs fitted K-dist PDF
         - Bottom-left:  Single range-bin PSD (FFT) vs Gaussian model PSD
-        - Bottom-right: Texture autocorrelation (measured vs exponential)
+        - Bottom-right: Texture marginal across range bins vs Gamma PDF
 
         Requires ``matplotlib``.
         """
@@ -530,25 +569,22 @@ class BistaticClutterModel:
         ax.set_title("PSD: FFT vs Gaussian Model")
         ax.legend()
 
-        # ---- Bottom-right: texture autocorrelation ----
+        # ---- Bottom-right: texture marginal across range bins ----
+        # Texture is constant within a CPI (τ ≈ 3 s ≫ CPI), so the
+        # K-distribution check is the *across-bin* Gamma marginal.
         ax = axes[1, 1]
-        tex_row = texture[ref_bin, :]
-        tex_row = tex_row - tex_row.mean()
-        acf_measured = np.correlate(tex_row, tex_row, mode="full")
-        acf_measured = acf_measured[len(tex_row) - 1 :]
-        if acf_measured[0] > 0:
-            acf_measured /= acf_measured[0]
+        tex_bins = texture[:, 0]
+        ax.hist(tex_bins, bins=60, density=True, alpha=0.6,
+                color="steelblue", label="Per-bin texture")
 
-        lags = np.arange(len(acf_measured)) / self.prf_hz
-        tau_texture = 3.0
-        acf_model = np.exp(-lags / tau_texture)
-
-        ax.plot(lags * 1e3, acf_measured, label="Measured ACF")
-        ax.plot(lags * 1e3, acf_model, "r--", lw=2,
-                label=f"exp(−τ/{tau_texture:.0f}s)")
-        ax.set_xlabel("Lag (ms)")
-        ax.set_ylabel("Autocorrelation")
-        ax.set_title("Texture Autocorrelation")
+        x_max = float(np.percentile(tex_bins, 99.5))
+        x_grid = np.linspace(1e-6, max(x_max, 1.0), 400)
+        gamma_pdf = stats.gamma.pdf(x_grid, a=nu, scale=1.0 / nu)
+        ax.plot(x_grid, gamma_pdf, "r-", lw=2,
+                label=f"Gamma(ν={nu:.2f}, 1/ν) PDF")
+        ax.set_xlabel("Texture intensity")
+        ax.set_ylabel("Density")
+        ax.set_title("Texture Marginal vs Gamma PDF")
         ax.legend()
 
         plt.tight_layout()
@@ -557,12 +593,154 @@ class BistaticClutterModel:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Radar system parameters & range equation
+# ═══════════════════════════════════════════════════════════════════════════
+
+_BOLTZMANN: float = 1.380649e-23  # J/K
+_T0_K: float = 290.0              # standard noise reference temperature
+
+
+@dataclass
+class RadarSystemParams:
+    """System parameters for the target SNR range equation.
+
+    Defaults are **assumed** values for a small drone-mounted 77 GHz
+    pulsed radar node (no source in the corpus specifies a real
+    SENTINEL-class design) — chosen to give single-digit-km detection
+    ranges against a −13 dBsm sea-skimmer, consistent with the 4.5 km
+    range window of the integrated dataset.  Override per scenario.
+
+    The range equation is applied quasi-monostatically: the drone is
+    treated as both transmitter and receiver (R_tx ≈ R_rx = drone-to-
+    target range).  The bistatic angle β is still used for the clutter
+    statistics and Doppler correction; the SNR error from this
+    simplification is documented in KNOWN_LIMITATIONS.
+    """
+
+    peak_power_w: float = 50.0
+    tx_gain_db: float = 38.0
+    rx_gain_db: float = 38.0
+    noise_figure_db: float = 8.0
+    system_loss_db: float = 5.0
+    bandwidth_hz: float = 50.0e6   # ≈ c/(2·ΔR) for 3 m range resolution
+    carrier_freq_ghz: float = 77.0
+
+    def snr_single_pulse(self, rcs_dbsm: float, range_m: float) -> float:
+        """Single-pulse target SNR (linear) from the radar range equation.
+
+            SNR = Pt·Gt·Gr·λ²·σ / ((4π)³·R⁴·k·T₀·B·F·L)
+
+        Coherent integration gain over the CPI is *not* included here —
+        the Doppler FFT in the processing chain provides it naturally.
+        """
+        lambda_m = 3.0e8 / (self.carrier_freq_ghz * 1.0e9)
+        sigma = 10.0 ** (rcs_dbsm / 10.0)
+        gt = 10.0 ** (self.tx_gain_db / 10.0)
+        gr = 10.0 ** (self.rx_gain_db / 10.0)
+        noise_f = 10.0 ** (self.noise_figure_db / 10.0)
+        loss = 10.0 ** (self.system_loss_db / 10.0)
+
+        r = max(float(range_m), 1.0)
+        signal = (
+            self.peak_power_w * gt * gr * lambda_m**2 * sigma
+            / ((4.0 * np.pi) ** 3 * r**4)
+        )
+        noise = _BOLTZMANN * _T0_K * self.bandwidth_hz * noise_f * loss
+        return signal / noise
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Standalone: embed_target_in_clutter
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Sea-surface reflection coefficient (accounts for phase inversion and
-# slight scattering loss at 77 GHz over the ocean surface).
-_GAMMA_SEA: float = -0.9
+# Smooth-sea reflection coefficient at small grazing angles.  Assuming
+# infinite surface impedance is a good approximation at microwave
+# frequencies and small grazing angles (Karimian 2012, UCSD thesis,
+# eq. 3.12-3.14), giving Γ₀ = −1 for both polarisations.  Roughness then
+# reduces |Γ| via the Miller-Brown-Vegh factor (see
+# rough_sea_reflection_coefficient).
+_GAMMA_SMOOTH: float = -1.0
+
+
+def rough_sea_reflection_coefficient(
+    grazing_sin: float,
+    lambda_m: float,
+    wind_speed_mps: float = 7.0,
+) -> float:
+    """Effective sea-surface reflection coefficient Γ = ρ·Γ₀.
+
+    Miller-Brown-Vegh (MBV) roughness reduction of the smooth-surface
+    reflection coefficient (Karimian 2012, eqs. 2.16-2.19):
+
+        γ_w = h_w · sin(ψ) / λ
+        ρ   = exp(−2(2π·γ_w)²) · I₀(2(2π·γ_w)²)
+        Γ   = ρ · Γ₀,   Γ₀ = −1  (small grazing, microwave)
+
+    where h_w is the rms wave height from the Phillips ocean-wave
+    spectrum, h_w = 0.0051 · v_w², with v_w the wind speed in m/s.
+
+    At 77 GHz (λ ≈ 3.9 mm) even modest seas make γ_w large at all but
+    the shallowest grazing angles, so |Γ| collapses toward zero and the
+    coherent multipath lobing structure largely washes out — a fixed
+    Γ = −0.9 grossly overstates multipath fading at mmWave.
+
+    Parameters
+    ----------
+    grazing_sin : float
+        Sine of the grazing angle ψ of the sea-reflected path.
+    lambda_m : float
+        Radar wavelength in metres.
+    wind_speed_mps : float
+        Wind speed in m/s (default 7 → h_w ≈ 0.25 m, mid sea state 3).
+
+    Returns
+    -------
+    float
+        Effective (signed, real) reflection coefficient Γ ∈ (−1, 0].
+    """
+    h_w = 0.0051 * wind_speed_mps**2  # Phillips rms wave height (m)
+    gamma_w = h_w * max(grazing_sin, 0.0) / lambda_m
+    g = 2.0 * (2.0 * np.pi * gamma_w) ** 2
+    # ρ = exp(−g)·I₀(g), computed via the exponentially scaled Bessel
+    # function i0e to stay finite for large g.
+    rho = float(special.i0e(g))
+    return _GAMMA_SMOOTH * rho
+
+
+def multipath_propagation_factor(
+    target_range_m: float,
+    radar_alt_m: float,
+    target_alt_m: float,
+    lambda_m: float,
+    wind_speed_mps: float = 7.0,
+) -> complex:
+    """Complex two-ray propagation factor F = 1 + Γ·exp(−jΔΦ).
+
+    Flat-earth two-ray model (valid for ground range ≫ altitudes):
+
+        R_g = √(R² − Δh²)           ground range
+        ΔR ≈ 2·h_r·h_t / R_g        path-length difference
+        ΔΦ = 2π·ΔR / λ              phase difference
+        sinψ ≈ (h_r + h_t) / √(R_g² + (h_r+h_t)²)   grazing angle
+        Γ   = MBV rough-sea coefficient (see above)
+
+    Returns F as a complex factor applied to the target voltage.
+    """
+    delta_alt = radar_alt_m - target_alt_m
+    r_g = np.sqrt(max(target_range_m**2 - delta_alt**2, 1.0))
+
+    delta_r = 2.0 * radar_alt_m * target_alt_m / r_g
+    delta_phi = 2.0 * np.pi * delta_r / lambda_m
+
+    h_sum = radar_alt_m + target_alt_m
+    grazing_sin = h_sum / np.sqrt(r_g**2 + h_sum**2)
+
+    gamma = rough_sea_reflection_coefficient(
+        grazing_sin=grazing_sin,
+        lambda_m=lambda_m,
+        wind_speed_mps=wind_speed_mps,
+    )
+    return 1.0 + gamma * np.exp(-1j * delta_phi)
 
 
 def embed_target_in_clutter(
@@ -576,6 +754,8 @@ def embed_target_in_clutter(
     target_absolute_range_m: Optional[float] = None,
     drone_alt_m: Optional[float] = None,
     target_alt_m: Optional[float] = None,
+    wind_speed_mps: float = 7.0,
+    radar_params: Optional[RadarSystemParams] = None,
 ) -> np.ndarray:
     """Inject a coherent point-target signal into a clutter voltage array.
 
@@ -595,8 +775,11 @@ def embed_target_in_clutter(
     2. Phase difference:        ``ΔΦ = 2π·ΔR / λ``
     3. Propagation factor:      ``F = 1 + Γ·exp(−jΔΦ)``
 
-    where ``Γ ≈ −0.9`` is the sea-surface reflection coefficient
-    (phase-inverting with slight scattering loss).
+    where ``Γ = ρ·Γ₀`` is the *rough-sea* reflection coefficient:
+    Γ₀ = −1 (smooth sea, small grazing) reduced by the
+    Miller-Brown-Vegh roughness factor ρ, which depends on grazing
+    angle, wavelength, and wind speed (see
+    :func:`rough_sea_reflection_coefficient`).
 
     The effective target voltage is multiplied by *F*, producing
     large fading nulls when the two paths destructively interfere
@@ -633,6 +816,14 @@ def embed_target_in_clutter(
         Altitude of the radar drone in metres above sea level.
     target_alt_m : float or None
         Altitude of the target in metres above sea level.
+    wind_speed_mps : float
+        Wind speed for the rough-sea multipath reflection coefficient.
+    radar_params : RadarSystemParams or None
+        When provided (together with *target_absolute_range_m*), the
+        target amplitude is set by the radar range equation — SNR falls
+        off as R⁻⁴.  When ``None``, the legacy behaviour applies: the
+        RCS value is interpreted directly as SNR in dB with no range
+        dependence (suitable only for normalised single-frame samples).
 
     Returns
     -------
@@ -641,11 +832,18 @@ def embed_target_in_clutter(
     """
     n_pulses = clutter_map.shape[1]
 
-    # Linear RCS from dBsm.
-    rcs_linear = 10.0 ** (target_rcs_dbsm / 10.0)
-
-    # Target amplitude (voltage) scaled relative to noise power.
-    amplitude = np.sqrt(rcs_linear * noise_power)
+    if radar_params is not None and target_absolute_range_m is not None:
+        # Physical SNR from the radar range equation (single pulse;
+        # the Doppler FFT supplies the coherent integration gain).
+        snr_linear = radar_params.snr_single_pulse(
+            rcs_dbsm=target_rcs_dbsm, range_m=target_absolute_range_m
+        )
+        amplitude = np.sqrt(snr_linear * noise_power)
+    else:
+        # Legacy normalised mode: RCS interpreted directly as SNR (dB)
+        # relative to the noise floor, with no range dependence.
+        rcs_linear = 10.0 ** (target_rcs_dbsm / 10.0)
+        amplitude = np.sqrt(rcs_linear * noise_power)
 
     # Pulse index vector.
     pulse_idx = np.arange(n_pulses, dtype=float)
@@ -661,22 +859,14 @@ def embed_target_in_clutter(
         and drone_alt_m is not None
         and target_alt_m is not None
     ):
-        # Radar wavelength.
         lambda_m = 3.0e8 / (carrier_freq_ghz * 1.0e9)
-
-        # Ground range via Pythagorean theorem (clamped to ≥ 1 m to
-        # avoid division-by-zero when the target is directly below).
-        delta_alt = drone_alt_m - target_alt_m
-        R_g = np.sqrt(max(target_absolute_range_m**2 - delta_alt**2, 1.0))
-
-        # Path-length difference between direct and reflected paths.
-        delta_R = 2.0 * drone_alt_m * target_alt_m / R_g
-
-        # Phase difference.
-        delta_phi = 2.0 * np.pi * delta_R / lambda_m
-
-        # Complex propagation factor.
-        F = 1.0 + _GAMMA_SEA * np.exp(-1j * delta_phi)
+        F = multipath_propagation_factor(
+            target_range_m=target_absolute_range_m,
+            radar_alt_m=drone_alt_m,
+            target_alt_m=target_alt_m,
+            lambda_m=lambda_m,
+            wind_speed_mps=wind_speed_mps,
+        )
 
     # Coherent complex-exponential target signal with multipath.
     target_signal = F * amplitude * np.exp(
@@ -782,6 +972,44 @@ class CFARDetector:
                     detections[r, d] = 1
 
         return detections
+
+    def detect_vectorized(self, power_map: np.ndarray) -> np.ndarray:
+        """Vectorized CA-CFAR along the Doppler axis with wrap-around.
+
+        Equivalent threshold logic to :meth:`detect` but computed with
+        uniform filters in O(N) — use this for batch evaluation.  The
+        Doppler axis is treated as circular (wrap mode), which is
+        physically correct after an FFT, so edge cells are tested
+        rather than skipped.
+
+        Parameters
+        ----------
+        power_map : np.ndarray, shape ``(n_range, n_doppler)``
+            Power values in **linear** scale (not dB).
+
+        Returns
+        -------
+        np.ndarray, shape ``(n_range, n_doppler)``
+            Binary detection map, dtype ``np.int32``.
+        """
+        from scipy.ndimage import uniform_filter1d
+
+        power_map = np.asarray(power_map, dtype=float)
+        win_total = 2 * (self.guard_cells + self.training_cells) + 1
+        win_guard = 2 * self.guard_cells + 1
+
+        sum_total = uniform_filter1d(
+            power_map, size=win_total, axis=1, mode="wrap"
+        ) * win_total
+        sum_guard = uniform_filter1d(
+            power_map, size=win_guard, axis=1, mode="wrap"
+        ) * win_guard
+
+        n_train = 2 * self.training_cells
+        noise_est = (sum_total - sum_guard) / n_train
+        threshold = noise_est * self.threshold_factor
+
+        return (power_map > threshold).astype(np.int32)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

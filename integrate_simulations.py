@@ -36,7 +36,12 @@ from typing import Any
 import numpy as np
 from tqdm import trange
 
-from clutter_model import BistaticClutterModel, embed_target_in_clutter
+from clutter_model import (
+    BistaticClutterModel,
+    RadarSystemParams,
+    embed_target_in_clutter,
+    multipath_propagation_factor,
+)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -230,6 +235,7 @@ def build_radar_timeline(
     cpi_pulses: int = DEFAULT_CPI_PULSES,
     base_rcs_dbsm: float = DEFAULT_BASE_RCS_DBSM,
     seed: int | None = None,
+    swerling_model: int = 3,
 ) -> RadarTimeline:
     """Resample drone-relative trajectory onto the radar CPI cadence.
 
@@ -245,14 +251,20 @@ def build_radar_timeline(
     cpi_pulses : int
         Pulses per coherent processing interval.
     base_rcs_dbsm : float
-        Mean RCS in dBsm for the Swerling-1 model.
+        Mean RCS in dBsm for the Swerling fluctuation model.
     seed : int or None
         RNG seed for RCS scintillation.
+    swerling_model : int
+        1 → exponential RCS (many comparable scatterers); 3 →
+        chi-squared 4-DOF (one dominant + small scatterers).
+        Swerling 3 is the usual choice for anti-ship missiles
+        (Kostis 2021, JDMS).  Fluctuation is drawn independently per
+        CPI frame (fast/frame-to-frame decorrelation assumption).
 
     Returns
     -------
     RadarTimeline
-        CPI-aligned timeline with Swerling-1 RCS.
+        CPI-aligned timeline with fluctuating RCS.
     """
     cpi_duration_s = cpi_pulses / prf_hz  # e.g. 0.128 s
     t_max = float(traj.t_s[-1])
@@ -266,10 +278,18 @@ def build_radar_timeline(
     vr_interp    = np.interp(t_cpi, traj.t_s, traj.rel_vr_mps)
     alt_interp   = np.interp(t_cpi, traj.t_s, traj.z_m)
 
-    # Swerling-1 RCS scintillation.
+    # Swerling RCS scintillation.
     rng = np.random.default_rng(seed)
     base_rcs_linear = 10.0 ** (base_rcs_dbsm / 10.0)
-    rcs_linear = rng.exponential(scale=base_rcs_linear, size=n_frames)
+    if swerling_model == 3:
+        # Chi-squared, 4 DOF: Gamma(shape=2, scale=mean/2).
+        rcs_linear = rng.gamma(
+            shape=2.0, scale=base_rcs_linear / 2.0, size=n_frames
+        )
+    elif swerling_model == 1:
+        rcs_linear = rng.exponential(scale=base_rcs_linear, size=n_frames)
+    else:
+        raise ValueError(f"swerling_model must be 1 or 3, got {swerling_model}")
     rcs_dbsm = 10.0 * np.log10(np.maximum(rcs_linear, 1e-30))
 
     return RadarTimeline(
@@ -303,7 +323,11 @@ def compute_doppler_metadata(
     Parameters
     ----------
     velocity_mps : float
-        Absolute radial velocity in m/s (always positive).
+        Signed radial velocity in m/s.  Negative = closing (target
+        approaching the drone) → positive Doppler; positive = receding
+        → negative Doppler.  The sign must be preserved so closing and
+        receding targets land on opposite sides of the Doppler axis
+        (the Doppler-notch crossover as the missile passes the drone).
     lam : float
         Radar wavelength in metres.
     prf : int
@@ -323,8 +347,9 @@ def compute_doppler_metadata(
     """
     cos_half = math.cos(math.radians(bistatic_deg / 2.0))
 
-    # True physical Doppler — keep for physics labels.
-    fd_true = 2.0 * velocity_mps * cos_half / lam
+    # True physical Doppler — keep for physics labels.  The leading
+    # minus maps closing (v_r < 0) to positive Doppler.
+    fd_true = -2.0 * velocity_mps * cos_half / lam
 
     # Alias into [-PRF/2, PRF/2) — this is what the RD map shows.
     fd_res = prf / cpi
@@ -339,7 +364,7 @@ def compute_doppler_metadata(
         "doppler_hz": fd_true,
         "doppler_hz_aliased": fd_aliased,
         "doppler_bin": doppler_bin,
-        "doppler_wraps": int(fd_true // prf),
+        "doppler_wraps": int(abs(fd_true) // prf),
     }
 
 
@@ -358,6 +383,9 @@ def generate_integrated_dataset(
     cnr_db: float = DEFAULT_CNR_DB,
     range_resolution_m: float = DEFAULT_RANGE_RES_M,
     base_rcs_dbsm: float = DEFAULT_BASE_RCS_DBSM,
+    radar_params: RadarSystemParams | None = None,
+    swerling_model: int = 3,
+    seed: int | None = None,
 ) -> list[Path]:
     """Generate integrated Range-Doppler videos for all trajectories.
 
@@ -385,7 +413,17 @@ def generate_integrated_dataset(
     range_resolution_m : float
         Range bin width in metres.
     base_rcs_dbsm : float
-        Mean Swerling-1 RCS in dBsm.
+        Mean RCS in dBsm for the Swerling fluctuation model.
+    radar_params : RadarSystemParams or None
+        Radar system parameters for the range equation.  ``None``
+        (default) uses ``RadarSystemParams()`` defaults — target SNR
+        then falls off as R⁻⁴ instead of being range-independent.
+    swerling_model : int
+        RCS fluctuation model: 1 or 3 (default 3, per anti-ship
+        missile convention).
+    seed : int or None
+        Master seed for reproducibility.  Per-trajectory seeds are
+        derived from it and recorded in each file's radar_config.
 
     Returns
     -------
@@ -395,6 +433,11 @@ def generate_integrated_dataset(
     in_path = Path(input_dir)
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
+
+    if radar_params is None:
+        radar_params = RadarSystemParams(carrier_freq_ghz=77.0)
+
+    seed_seq = np.random.SeedSequence(seed)
 
     txt_files = sorted(in_path.glob("cruise_run_*.txt"))
     if not txt_files:
@@ -410,6 +453,9 @@ def generate_integrated_dataset(
         print(f"\n{'─'*60}")
         print(f"Processing: {traj_file.name}")
 
+        # Derive a recorded, reproducible seed for this trajectory.
+        run_seed = int(seed_seq.spawn(1)[0].generate_state(1)[0])
+
         # ── parse & resample ──────────────────────────────────────
         traj = parse_missile_trajectory(traj_file, drone_pos=drone_pos)
         timeline = build_radar_timeline(
@@ -417,6 +463,8 @@ def generate_integrated_dataset(
             prf_hz=prf_hz,
             cpi_pulses=cpi_pulses,
             base_rcs_dbsm=base_rcs_dbsm,
+            seed=run_seed,
+            swerling_model=swerling_model,
         )
 
         n_frames = timeline.n_frames
@@ -431,7 +479,22 @@ def generate_integrated_dataset(
         )
         frame_metadata: list[dict[str, Any]] = []
 
-        rng = np.random.default_rng()
+        rng = np.random.default_rng(run_seed + 1)
+
+        # One model per trajectory: the Gamma texture must evolve
+        # continuously across CPI frames (decorrelation ~3 s, frames
+        # ~0.128 s apart), so the model carries texture state between
+        # frames instead of being re-created per frame.
+        model = BistaticClutterModel(
+            bistatic_angle_deg=bistatic_angle_deg,
+            carrier_freq_ghz=77.0,
+            prf_hz=prf_hz,
+            cpi_pulses=cpi_pulses,
+            n_range_bins=n_range_bins,
+            cnr_db=cnr_db,
+            seed=run_seed,
+        )
+        cpi_duration_s = cpi_pulses / prf_hz
 
         for f_idx in trange(n_frames, desc=f"  {stem}", leave=False):
             r_m = float(timeline.range_m[f_idx])
@@ -442,9 +505,9 @@ def generate_integrated_dataset(
             # Range bin for this frame.
             target_range_bin = int(r_m / range_resolution_m)
 
-            # Doppler metadata (aliasing-aware).
+            # Doppler metadata (aliasing-aware, sign-preserving).
             dop = compute_doppler_metadata(
-                velocity_mps=abs(v_r),
+                velocity_mps=v_r,
                 lam=LAMBDA_M,
                 prf=prf_hz,
                 cpi=cpi_pulses,
@@ -459,15 +522,11 @@ def generate_integrated_dataset(
             target_in_bounds = 0 <= target_range_bin < n_range_bins
 
             # ── generate clutter + target ─────────────────────────
-            model = BistaticClutterModel(
-                bistatic_angle_deg=bistatic_angle_deg,
-                carrier_freq_ghz=77.0,
-                prf_hz=prf_hz,
-                cpi_pulses=cpi_pulses,
-                n_range_bins=n_range_bins,
-                cnr_db=cnr_db,
+            # First frame draws a fresh texture; subsequent frames
+            # evolve it forward by one CPI duration.
+            clutter_v = model.generate_clutter_voltage(
+                dt_since_last_s=cpi_duration_s if f_idx > 0 else None
             )
-            clutter_v = model.generate_clutter_voltage()
 
             # Multipath propagation factor (Generalized Target model).
             # drone_pos[2] is the radar drone altitude; tgt_alt is the
@@ -486,15 +545,16 @@ def generate_integrated_dataset(
                     target_absolute_range_m=r_m,
                     drone_alt_m=drone_pos[2],
                     target_alt_m=tgt_alt,
+                    radar_params=radar_params,
                 )
 
                 # Log the multipath factor magnitude for diagnostics.
-                _lambda = LAMBDA_M
-                _delta_alt = drone_pos[2] - tgt_alt
-                _R_g = np.sqrt(max(r_m**2 - _delta_alt**2, 1.0))
-                _delta_R = 2.0 * drone_pos[2] * tgt_alt / _R_g
-                _delta_phi = 2.0 * np.pi * _delta_R / _lambda
-                _F = 1.0 + (-0.9) * np.exp(-1j * _delta_phi)
+                _F = multipath_propagation_factor(
+                    target_range_m=r_m,
+                    radar_alt_m=drone_pos[2],
+                    target_alt_m=tgt_alt,
+                    lambda_m=LAMBDA_M,
+                )
                 multipath_factor_db = float(
                     20.0 * np.log10(max(abs(_F), 1e-30))
                 )
@@ -518,10 +578,17 @@ def generate_integrated_dataset(
 
             rd_video[f_idx, :, :] = power_db.astype(np.float32)
 
+            snr_single_pulse_db = float(
+                10.0 * np.log10(
+                    max(radar_params.snr_single_pulse(rcs_db, r_m), 1e-30)
+                )
+            )
+
             frame_metadata.append({
                 "frame": f_idx,
                 "t_s": float(timeline.t_cpi_s[f_idx]),
                 "range_m": r_m,
+                "snr_single_pulse_db": snr_single_pulse_db,
                 "range_bin": target_range_bin if target_in_bounds else -1,
                 "velocity_mps": v_r,
                 "doppler_hz": doppler_hz,
@@ -552,6 +619,14 @@ def generate_integrated_dataset(
                 prf_hz * LAMBDA_M / (4.0 * cos_half)
             ),
             "velocity_folding": True,
+            "swerling_model": swerling_model,
+            "run_seed": run_seed,
+            "radar_peak_power_w": radar_params.peak_power_w,
+            "radar_tx_gain_db": radar_params.tx_gain_db,
+            "radar_rx_gain_db": radar_params.rx_gain_db,
+            "radar_noise_figure_db": radar_params.noise_figure_db,
+            "radar_system_loss_db": radar_params.system_loss_db,
+            "radar_bandwidth_hz": radar_params.bandwidth_hz,
         }
 
         out_file = out_path / f"{stem}.npz"
@@ -627,7 +702,15 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--rcs", type=float, default=DEFAULT_BASE_RCS_DBSM,
-        help="Mean Swerling-1 RCS in dBsm (default -13).",
+        help="Mean RCS in dBsm (default -13).",
+    )
+    p.add_argument(
+        "--swerling", type=int, default=3, choices=[1, 3],
+        help="Swerling RCS fluctuation model (default 3).",
+    )
+    p.add_argument(
+        "--seed", type=int, default=None,
+        help="Master seed for reproducible generation.",
     )
     return p.parse_args()
 
@@ -651,4 +734,6 @@ if __name__ == "__main__":
         cnr_db=args.cnr,
         range_resolution_m=args.range_res,
         base_rcs_dbsm=args.rcs,
+        swerling_model=args.swerling,
+        seed=args.seed,
     )

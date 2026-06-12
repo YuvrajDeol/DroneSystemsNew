@@ -20,13 +20,14 @@ class MissileState:
 
 @dataclass(slots=True)
 class Missile:
+    # Defaults match config/sim_config.yaml — keep the two in sync.
     mass_kg: float = 100.0
     max_accel_mps2: float = 30.0
     air_density_kgpm3: float = 1.225  # sea-level nominal density
-    drag_area_m2: float = 0.05  # effective Cd * A
+    drag_area_m2: float = 0.003  # effective Cd * A
     cruise_speed_mps: float = 850.0
-    speed_hold_kp: float = 0.03
-    max_thrust_n: float = 12000.0
+    speed_hold_kp: float = 0.2
+    max_thrust_n: float = 4000.0
     gravity_mps2: float = 9.81
 
     def _clamp_accel_cmd(self, accel_cmd_mps2: np.ndarray) -> np.ndarray:
