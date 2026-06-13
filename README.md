@@ -68,9 +68,27 @@ Runs a vectorized CA-CFAR over every frame and reports probability of
 detection binned by range plus the measured false-alarm rate.
 
 **Stage 4 — visualization** ([radar_visualizer.py](radar_visualizer.py)).
-Pygame console that plays back RD videos with CFAR detections and
-track overlays. [npz_converter.py](npz_converter.py) dumps `.npz`
-contents to CSV/JSON/text.
+Pygame console that plays back the RD videos in two modes (toggle with
+`TAB`):
+
+- **TECHNICAL** — full engineering view: range-Doppler heatmap with a dB
+  colour scale, live CFAR detections, the ground-truth target cell, the
+  confirmed Kalman tracks, the picket geometry, and complete per-frame
+  telemetry + detector stats.
+- **PRESENTATION** — a clean, self-explaining briefing view: a
+  plain-language target card, a detection-status banner, and the
+  picket-fence engagement profile with a live "detecting here" marker.
+
+Detection status is **truth-gated** — the banner reads *TARGET TRACKED*
+only when CFAR actually fires within a few cells of the known target
+location for that frame. Nothing is hard-coded.
+
+Controls: `SPACE` play/pause · `←/→` step · `TAB` switch view ·
+`[ / ]` change dataset · `D` detections · `T` tracks · `C` CFAR
+algorithm · `ESC/Q` quit. Click the timeline to scrub.
+
+[npz_converter.py](npz_converter.py) dumps `.npz` contents to
+CSV/JSON/text.
 
 ## Physics notes & known limitations
 
