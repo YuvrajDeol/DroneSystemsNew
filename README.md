@@ -53,7 +53,8 @@ Each run randomizes cruise altitude (4.5–60 m) and speed (Mach 0.8–3.5).
 
 **Stage 2 — radar integration** ([integrate_simulations.py](integrate_simulations.py),
 [clutter_model.py](clutter_model.py)).
-A radar drone hovers at a forward picket position; each trajectory is
+A radar drone hovers at a centred picket position (midway along the
+launch→target corridor, default `(-10000, 0, 50)` m); each trajectory is
 converted to drone-relative range/radial-velocity, resampled onto
 128-pulse CPIs, and embedded into compound K-distribution bistatic sea
 clutter (NetRAD-parameterised, frequency-scaled to 77 GHz). Target
@@ -83,9 +84,28 @@ Detection status is **truth-gated** — the banner reads *TARGET TRACKED*
 only when CFAR actually fires within a few cells of the known target
 location for that frame. Nothing is hard-coded.
 
-Controls: `SPACE` play/pause · `←/→` step · `TAB` switch view ·
-`[ / ]` change dataset · `D` detections · `T` tracks · `C` CFAR
-algorithm · `ESC/Q` quit. Click the timeline to scrub.
+Controls: `SPACE` play/pause · `←/→` step · `R` rewind · `V` reverse ·
+`+/−` speed · `TAB` switch view · `[ / ]` change dataset · `D`
+detections · `T` tracks · `C` CFAR algorithm · `ESC/Q` quit. Click the
+timeline to scrub, or use the on-screen transport buttons.
+
+**Interactive geometry (technical view).** The DRONE GEOMETRY panel
+lets you move the picket drone and **re-runs the real radar
+integration** for the current trajectory — range, Doppler, multipath
+and target SNR are all recomputed (not just a moved marker):
+
+- `CENTER FIELD` (the default geometry) — drone at the midpoint of the
+  missile's track, so the target closes from the left, passes **under**
+  the drone (crossing the Doppler notch), and recedes to the right — the
+  classic intercept geometry.
+- `PICKET` — forward picket near the launch point, for comparison
+  (missile launches beside the drone and flies away).
+- `ALT +10 m` / `ALT −10 m` — raise/lower the drone (changes grazing
+  angle, multipath and detection range).
+
+Re-simulation needs the matching trajectory log in `logs/`; it takes a
+few seconds (a "RE-SIMULATING…" overlay is shown) and updates the view
+in place without touching the saved `.npz`.
 
 [npz_converter.py](npz_converter.py) dumps `.npz` contents to
 CSV/JSON/text.

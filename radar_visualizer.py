@@ -325,8 +325,12 @@ class Console:
 
         self.mode = "presentation"      # or "technical"
         self.playing = True
-        self.speed = 1.0
+        self.speeds = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
+        self.speed_idx = 2
+        self.speed = self.speeds[self.speed_idx]
+        self.play_dir = 1               # +1 forward, -1 reverse
         self.last_tick = pygame.time.get_ticks() / 1000.0
+        self.busy_msg = ""
 
         self.show_detections = True
         self.show_tracks = True
@@ -361,8 +365,44 @@ class Console:
                    if self.n_frames > 1 else 0.128)
         self.int_gain_db = 10.0 * math.log10(self.cpi)
 
+        # Drone geometry: original (from npz) and editable (for re-sim).
+        self.orig_drone_pos = [float(v) for v in self.cfg["drone_pos"]]
+        self.sim_drone_pos = list(self.orig_drone_pos)
+        self.log_path = self._find_log(path.stem)
+        self.traj_x = self._read_traj_x_extent(self.log_path)
+        self.resim_note = "" if self.log_path else "no log -> re-sim disabled"
+
         self._precompute()
         self._eval_frame()
+
+    def _find_log(self, stem: str):
+        """Locate the trajectory .txt whose stem matches this dataset."""
+        for cand in (Path("logs") / f"{stem}.txt",
+                     self.data_dir.parent / "logs" / f"{stem}.txt",
+                     self.data_dir / f"{stem}.txt"):
+            if cand.exists():
+                return cand
+        return None
+
+    @staticmethod
+    def _read_traj_x_extent(log_path):
+        """Return (x_min, x_max) of the trajectory, or None."""
+        if log_path is None:
+            return None
+        xs = []
+        started = False
+        for line in log_path.read_text().splitlines():
+            if line.strip().startswith("---"):
+                started = True
+                continue
+            if started:
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
+                        xs.append(float(parts[1]))
+                    except ValueError:
+                        pass
+        return (min(xs), max(xs)) if xs else None
 
     def _precompute(self):
         """One-time per-dataset pass: CFAR + clustering + tracking per frame,
@@ -415,6 +455,58 @@ class Console:
         self.snapshot = c["snapshot"]
         self.snr_eff_db = float(m["snr_single_pulse_db"]) + self.int_gain_db
 
+    def _resimulate(self):
+        """Re-run the radar integration for the current trajectory with the
+        edited drone position/altitude — the real geometry, not a marker."""
+        if self.log_path is None:
+            return
+        self._draw(); self._flash_busy("RE-SIMULATING RADAR GEOMETRY...")
+        from integrate_simulations import integrate_trajectory
+        from clutter_model import RadarSystemParams
+        cfg = self.cfg
+        rp = RadarSystemParams(
+            peak_power_w=cfg["radar_peak_power_w"],
+            tx_gain_db=cfg["radar_tx_gain_db"],
+            rx_gain_db=cfg["radar_rx_gain_db"],
+            noise_figure_db=cfg["radar_noise_figure_db"],
+            system_loss_db=cfg["radar_system_loss_db"],
+            bandwidth_hz=cfg["radar_bandwidth_hz"],
+            carrier_freq_ghz=cfg["carrier_freq_ghz"],
+        )
+        rd, meta, new_cfg = integrate_trajectory(
+            self.log_path,
+            drone_pos=tuple(self.sim_drone_pos),
+            bistatic_angle_deg=cfg["bistatic_angle_deg"],
+            prf_hz=int(cfg["prf_hz"]),
+            cpi_pulses=int(cfg["cpi_pulses"]),
+            n_range_bins=int(cfg["n_range_bins"]),
+            cnr_db=cfg["cnr_db"],
+            range_resolution_m=cfg["range_resolution_m"],
+            base_rcs_dbsm=cfg["base_rcs_dbsm"],
+            radar_params=rp,
+            swerling_model=int(cfg.get("swerling_model", 3)),
+            run_seed=cfg.get("run_seed"),
+        )
+        self.rd, self.meta, self.cfg = rd, meta, new_cfg
+        self.n_frames, self.n_range, self.n_dop = rd.shape
+        self.frame = min(self.frame, self.n_frames - 1)
+        self.drone_alt = float(new_cfg["drone_pos"][2])
+        self._hm_key = None
+        self._precompute()
+        self._eval_frame()
+        self.resim_note = (f"drone @ x={self.sim_drone_pos[0]:.0f} m, "
+                           f"{self.sim_drone_pos[2]:.0f} m alt")
+
+    def _flash_busy(self, msg):
+        ov = pygame.Surface((self.W, self.H), pygame.SRCALPHA)
+        ov.fill((0, 0, 0, 170))
+        self.screen.blit(ov, (0, 0))
+        box = pygame.Rect(self.W // 2 - 240, self.H // 2 - 40, 480, 80)
+        pygame.draw.rect(self.screen, PANEL, box, border_radius=10)
+        pygame.draw.rect(self.screen, CYAN, box, width=2, border_radius=10)
+        self._text(msg, box.center, self.f_h2, CYAN, "c")
+        pygame.display.flip()
+
     # ── playback / events ─────────────────────────────────────────────
 
     def run(self):
@@ -432,7 +524,7 @@ class Console:
             return
         now = pygame.time.get_ticks() / 1000.0
         if now - self.last_tick >= self.dt / max(self.speed, 1e-3):
-            self.frame = (self.frame + 1) % self.n_frames
+            self.frame = (self.frame + self.play_dir) % self.n_frames
             self.last_tick = now
             self._eval_frame()
 
@@ -471,6 +563,17 @@ class Console:
                     self.cfar_algo = "OS-CFAR" if self.cfar_algo == "CA-CFAR" else "CA-CFAR"
                     self._precompute()
                     self._eval_frame()
+                elif e.key == pygame.K_r:                 # rewind to start
+                    self.play_dir = 1
+                    self._set_frame(0)
+                elif e.key == pygame.K_v:                 # reverse direction
+                    self.play_dir *= -1
+                elif e.key in (pygame.K_PLUS, pygame.K_EQUALS):
+                    self.speed_idx = min(self.speed_idx + 1, len(self.speeds) - 1)
+                    self.speed = self.speeds[self.speed_idx]
+                elif e.key == pygame.K_MINUS:
+                    self.speed_idx = max(self.speed_idx - 1, 0)
+                    self.speed = self.speeds[self.speed_idx]
             if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
                 self._click(e.pos)
         return True
@@ -482,10 +585,34 @@ class Console:
                     self.mode = "technical" if self.mode == "presentation" else "presentation"
                 elif name == "play":
                     self.playing = not self.playing
+                elif name == "rewind":
+                    self.play_dir = 1; self._set_frame(0)
+                elif name == "reverse":
+                    self.play_dir *= -1
+                elif name == "speed":
+                    self.speed_idx = (self.speed_idx + 1) % len(self.speeds)
+                    self.speed = self.speeds[self.speed_idx]
                 elif name == "prev":
                     self._cycle(-1)
                 elif name == "next":
                     self._cycle(1)
+                elif name == "drone_picket":
+                    # Forward picket near the launch point (left of field).
+                    if self.traj_x:
+                        self.sim_drone_pos = [self.traj_x[0] + 10.0, 0.0,
+                                              self.sim_drone_pos[2]]
+                        self._resimulate()
+                elif name == "drone_center":
+                    if self.traj_x:
+                        cx = 0.5 * (self.traj_x[0] + self.traj_x[1])
+                        self.sim_drone_pos = [cx, 0.0, self.sim_drone_pos[2]]
+                        self._resimulate()
+                elif name == "drone_up":
+                    self.sim_drone_pos[2] = min(self.sim_drone_pos[2] + 10.0, 300.0)
+                    self._resimulate()
+                elif name == "drone_down":
+                    self.sim_drone_pos[2] = max(self.sim_drone_pos[2] - 10.0, 5.0)
+                    self._resimulate()
                 elif name.startswith("run:"):
                     self.file_idx = int(name.split(":")[1])
                     self._load(self.files[self.file_idx])
@@ -567,9 +694,9 @@ class Console:
             y = rect.y + frac * rect.height
             km = frac * self.n_range * self.range_res / 1000.0
             self._text(f"{km:.1f}", (rect.x - 6, y), self.f_sm, MUTED, "tr")
-        self._text("Doppler (Hz) →", (rect.right, rect.bottom + 4),
+        self._text("Doppler (Hz)", (rect.right, rect.bottom + 4),
                    self.f_sm, FAINT, "tr")
-        self._text("Range (km) ↓", (rect.x - 6, rect.y - 2), self.f_sm, FAINT, "tr")
+        self._text("Range (km)", (rect.x - 6, rect.y - 2), self.f_sm, FAINT, "tr")
 
         if show_overlays and self.show_detections:
             for d in self.dets:
@@ -616,18 +743,32 @@ class Console:
     # ── picket-fence geometry (shared by both modes) ──────────────────
 
     def _draw_picket(self, rect, accent, big=False):
+        """Side-on battlefield profile: launch on the LEFT, defended asset on
+        the RIGHT, the missile sweeping left→right along the sea, and the
+        picket drone an elevated observer wherever it sits along that line."""
         m = self.meta[self.frame]
         R = float(m["range_m"])
         alt = float(m["target_alt_m"])
-        max_rng = self.n_range * self.range_res
-        max_alt = max(80.0, self.drone_alt * 1.4)
+        drone_x = float(self.cfg["drone_pos"][0])
+        drone_alt = self.drone_alt
 
-        plot = rect.inflate(-24, -40)
+        # Battlefield extent: launch (x_lo) on the left, target/asset on the
+        # right.  Include the drone so it is always on-screen.
+        if self.traj_x:
+            x_lo, x_hi = self.traj_x
+        else:
+            x_lo, x_hi = drone_x - 5000.0, drone_x + 5000.0
+        x_lo = min(x_lo, drone_x)
+        x_hi = max(x_hi, drone_x)
+        width_m = max(x_hi - x_lo, 1.0)
+        max_alt = max(80.0, drone_alt * 1.5)
+
+        plot = rect.inflate(-24, -44)
         plot.y += 8
         sea_y = plot.bottom - 14
 
-        def gx(downrange):
-            return plot.x + (downrange / max_rng) * plot.width
+        def gx(xx):
+            return plot.x + (xx - x_lo) / width_m * plot.width
         def gy(a):
             return sea_y - (a / max_alt) * (plot.height - 24)
 
@@ -637,52 +778,64 @@ class Console:
         for sx in range(int(plot.x), int(plot.right), 26):
             pygame.draw.arc(self.screen, (24, 54, 74),
                             (sx, sea_y - 3, 26, 8), math.pi, 2 * math.pi, 1)
-        self._text("SEA SURFACE", (plot.x + 2, sea_y + 4), self.f_sm, FAINT)
 
-        # range gridlines
-        for frac in (0.25, 0.5, 0.75, 1.0):
-            x = gx(frac * max_rng)
+        # downrange gridlines (measured from launch on the left)
+        for frac in (0.25, 0.5, 0.75):
+            x = plot.x + frac * plot.width
             pygame.draw.line(self.screen, GRID, (x, plot.y), (x, sea_y), 1)
-            self._text(f"{frac*max_rng/1000:.1f} km", (x, sea_y + 16),
-                       self.f_sm, MUTED, "mc")
+            self._text(f"{frac*width_m/1000:.0f} km", (x, sea_y + 4),
+                       self.f_sm, FAINT, "mc")
 
-        # picket fence: active node + standby mesh nodes (honest labelling)
-        px = gx(0)
-        py = gy(self.drone_alt)
-        for frac in (0.4, 0.72):
-            nx = gx(frac * max_rng)
-            ny = gy(self.drone_alt)
-            pygame.draw.line(self.screen, FAINT, (nx, ny), (nx, sea_y), 1)
-            pygame.draw.circle(self.screen, FAINT, (int(nx), int(ny)), 5, 1)
-            self._text("MESH (standby)", (nx, ny - 15), self.f_sm, FAINT, "mc")
+        # radar coverage band around the drone (its detection reach)
+        cov = self.n_range * self.range_res
+        cov_l = max(plot.x, gx(drone_x - cov))
+        cov_r = min(plot.right, gx(drone_x + cov))
+        band = pygame.Surface((max(cov_r - cov_l, 1), sea_y - plot.y),
+                              pygame.SRCALPHA)
+        band.fill((*accent, 18))
+        self.screen.blit(band, (cov_l, plot.y))
 
-        # missile marker
-        horiz = math.sqrt(max(R**2 - (self.drone_alt - alt)**2, 0.0))
-        mx, my = gx(horiz), gy(alt)
+        # launch point (left) and defended asset (right)
+        self._text("LAUNCH", (gx(x_lo) + 2, sea_y - 14), self.f_sm, FAINT, "ml")
+        ax = gx(x_hi)
+        pygame.draw.polygon(self.screen, MUTED,
+                            [(ax, sea_y - 14), (ax - 6, sea_y), (ax + 6, sea_y)])
+        self._text("ASSET", (ax, sea_y - 24), self.f_sm, MUTED, "mc")
+
+        # missile absolute battlefield x
+        dr = m.get("downrange_m")
+        missile_x = (dr + drone_x) if dr is not None else (
+            drone_x + math.sqrt(max(R**2 - (drone_alt - alt)**2, 0.0)))
+        mx, my = gx(missile_x), gy(alt)
+        drone_px, drone_py = gx(drone_x), gy(drone_alt)
         detected = self.truth_detected and self.truth_in
 
-        # line of sight
+        # line of sight drone → missile
         pygame.draw.line(self.screen, accent if detected else FAINT,
-                         (px, py), (mx, my), 1)
+                         (drone_px, drone_py), (mx, my), 1)
 
-        # active picket drone
-        pygame.draw.line(self.screen, accent, (px, py), (px, sea_y), 2)
-        pygame.draw.circle(self.screen, accent, (int(px), int(py)), 7)
-        pygame.draw.circle(self.screen, BG, (int(px), int(py)), 3)
-        self._text("PICKET DRONE", (px, py - 18), self.f_sm, accent, "mc")
-        self._text(f"{self.drone_alt:.0f} m", (px, py - 32), self.f_sm, MUTED, "mc")
+        # picket drone (elevated observer)
+        pygame.draw.line(self.screen, accent, (drone_px, drone_py),
+                         (drone_px, sea_y), 1)
+        pygame.draw.circle(self.screen, accent, (int(drone_px), int(drone_py)), 7)
+        pygame.draw.circle(self.screen, BG, (int(drone_px), int(drone_py)), 3)
+        self._text("PICKET DRONE", (drone_px, drone_py - 18), self.f_sm, accent, "mc")
+        self._text(f"{drone_alt:.0f} m alt", (drone_px, drone_py - 32),
+                   self.f_sm, MUTED, "mc")
 
-        # missile + detection marker
-        mcol = GREEN if detected else (RED if self.truth_in else FAINT)
-        pts = [(mx, my - 7), (mx + 7, my), (mx, my + 7), (mx - 7, my)]
+        # missile marker (always travels left → right) + detection state
+        mcol = GREEN if detected else (RED if self.truth_in else AMBER)
+        pts = [(mx - 7, my - 5), (mx + 7, my), (mx - 7, my + 5)]  # arrow →
         pygame.draw.polygon(self.screen, mcol, pts)
+        self._text("MISSILE", (mx, my - 16), self.f_sm, mcol, "mc")
         if detected:
             t = (pygame.time.get_ticks() // 120) % 6
             pygame.draw.circle(self.screen, GREEN, (int(mx), int(my)), 12 + t, 1)
-            self._text("◉ DETECTING", (mx, my + 14), self.f_sm, GREEN, "mc")
+            self._text("DETECTING", (mx, my + 13), self.f_sm, GREEN, "mc")
         elif self.truth_in:
-            self._text("target (in clutter)", (mx, my + 14), self.f_sm, RED, "mc")
-        self._text("MISSILE", (mx, my - 18), self.f_sm, mcol, "mc")
+            self._text("in clutter", (mx, my + 13), self.f_sm, RED, "mc")
+        else:
+            self._text("out of radar range", (mx, my + 13), self.f_sm, FAINT, "mc")
 
     # ── status helpers ────────────────────────────────────────────────
 
@@ -738,21 +891,28 @@ class Console:
                    (self.W / 2, 44), self.f_sm, FAINT, "mc")
 
     def _draw_footer(self):
-        bar = pygame.Rect(24, self.H - 30, self.W - 320, 12)
+        accent = CYAN if self.mode == "presentation" else GREEN
+        bar = pygame.Rect(24, self.H - 28, self.W - 470, 12)
         pygame.draw.rect(self.screen, PANEL, bar, border_radius=6)
         prog = bar.width * (self.frame / max(self.n_frames - 1, 1))
-        accent = CYAN if self.mode == "presentation" else GREEN
         pygame.draw.rect(self.screen, accent,
                          (bar.x, bar.y, prog, bar.height), border_radius=6)
-        knob = (bar.x + prog, bar.centery)
-        pygame.draw.circle(self.screen, WHITE, (int(knob[0]), int(knob[1])), 7)
+        pygame.draw.circle(self.screen, WHITE, (int(bar.x + prog), bar.centery), 7)
         self._buttons["timeline"] = bar
-        self._button("play", pygame.Rect(self.W - 280, self.H - 38, 90, 26),
+
+        y = self.H - 40
+        self._button("rewind", pygame.Rect(self.W - 430, y, 40, 28), "|<", col=accent)
+        self._button("reverse", pygame.Rect(self.W - 384, y, 40, 28),
+                     "REV", active=self.play_dir < 0, col=accent)
+        self._button("play", pygame.Rect(self.W - 338, y, 86, 28),
                      "PAUSE" if self.playing else "PLAY", col=accent)
-        self._button("prev", pygame.Rect(self.W - 180, self.H - 38, 36, 26), "‹", col=accent)
-        self._button("next", pygame.Rect(self.W - 138, self.H - 38, 36, 26), "›", col=accent)
-        self._text("TAB switch view · SPACE play · ←/→ step · [ ] dataset",
-                   (24, self.H - 48), self.f_sm, FAINT)
+        self._button("speed", pygame.Rect(self.W - 246, y, 60, 28),
+                     f"{self.speed:g}x", col=accent)
+        self._button("prev", pygame.Rect(self.W - 180, y, 40, 28), "<", col=accent)
+        self._button("next", pygame.Rect(self.W - 80, y, 40, 28), ">", col=accent)
+        self._text("TAB view  ·  SPACE play  ·  arrows step  ·  R rewind  ·  "
+                   "V reverse  ·  +/- speed  ·  [ ] dataset",
+                   (24, self.H - 46), self.f_sm, FAINT)
 
     # ── PRESENTATION ──────────────────────────────────────────────────
 
@@ -881,19 +1041,23 @@ class Console:
         self._draw_picket(gin, GREEN)
 
         cp = pygame.Rect(1146, top + 314, self.W - 1146 - 24, self.H - top - 314 - 56)
-        self._panel(cp, "CONTROLS & RUNS", GREEN)
-        self._button("det", pygame.Rect(cp.x + 16, cp.y + 44, 120, 28),
-                     f"DET {'ON' if self.show_detections else 'OFF'}",
-                     active=self.show_detections, col=AMBER)
-        self._buttons.pop("det", None)  # toggled via key D; show state only
-        self._button("trk", pygame.Rect(cp.x + 146, cp.y + 44, 120, 28),
-                     f"TRK {'ON' if self.show_tracks else 'OFF'}",
-                     active=self.show_tracks, col=CYAN)
-        self._buttons.pop("trk", None)
-        self._text("D detections · T tracks · C cfar algo",
-                   (cp.x + 16, cp.y + 80), self.f_sm, FAINT)
-        self._draw_runlist(pygame.Rect(cp.x + 16, cp.y + 104,
-                                       cp.width - 32, cp.height - 120))
+        self._panel(cp, "DRONE GEOMETRY  ·  re-simulates", GREEN)
+        # drone position / altitude controls (trigger real re-simulation)
+        bw = (cp.width - 32 - 8) // 2
+        self._button("drone_picket", pygame.Rect(cp.x + 16, cp.y + 40, bw, 26),
+                     "PICKET", col=GREEN)
+        self._button("drone_center", pygame.Rect(cp.x + 24 + bw, cp.y + 40, bw, 26),
+                     "CENTER FIELD", col=GREEN)
+        self._button("drone_up", pygame.Rect(cp.x + 16, cp.y + 72, bw, 26),
+                     "ALT +10 m", col=GREEN)
+        self._button("drone_down", pygame.Rect(cp.x + 24 + bw, cp.y + 72, bw, 26),
+                     "ALT -10 m", col=GREEN)
+        note = self.resim_note or f"drone @ {self.drone_alt:.0f} m alt"
+        self._text(note, (cp.x + 16, cp.y + 104), self.f_sm, MUTED)
+        self._text("D detections · T tracks · C cfar",
+                   (cp.x + 16, cp.y + 122), self.f_sm, FAINT)
+        self._draw_runlist(pygame.Rect(cp.x + 16, cp.y + 146,
+                                       cp.width - 32, cp.height - 162))
 
     def _legend_dot(self, x, y, col, label):
         pygame.draw.circle(self.screen, col, (x + 5, y + 6), 4, 1)
@@ -912,7 +1076,7 @@ class Console:
             name = self.files[i].stem.replace("cruise_run_", "RUN ")[:26]
             if active:
                 pygame.draw.rect(self.screen, PANEL_HI, r, border_radius=5)
-            self._text(("● " if active else "  ") + name, (r.x + 4, r.y + 3),
+            self._text(("> " if active else "  ") + name, (r.x + 4, r.y + 3),
                        self.f_sm, (CYAN if active else MUTED))
             self._buttons[f"run:{i}"] = r
 

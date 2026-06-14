@@ -11,12 +11,13 @@ training.
 
 Geometry (Look-Down / Forward Picket)
 -------------------------------------
-The radar drone hovers at a forward picket position near the missile's
-spawn point (default ``(-19990, 0, 50)`` m).  The missile launches at
-``x ≈ -20000`` m and flies toward the mothership at ``x = 0``.  All
-range and Doppler values are computed *relative to the drone*, not the
-origin.  As the missile passes beneath the drone, radial velocity
-crosses zero (Doppler notch) and becomes positive as it recedes.
+The radar drone hovers at a centred picket position (default
+``(-10000, 0, 50)`` m), midway along the launch→target corridor.  The
+missile launches at ``x ≈ -20000`` m and flies toward the mothership at
+``x = 0``.  All range and Doppler values are computed *relative to the
+drone*, not the origin.  As the missile passes beneath the drone,
+radial velocity crosses zero (Doppler notch) and becomes positive as it
+recedes.
 
 Usage
 -----
@@ -59,7 +60,11 @@ DEFAULT_N_RANGE_BINS: int = 1500
 DEFAULT_CNR_DB: float = 15.0
 DEFAULT_RANGE_RES_M: float = 3.0      # range-bin resolution (m)  → 4.5 km max
 DEFAULT_BASE_RCS_DBSM: float = -13.0  # sea-skimmer mean RCS
-DEFAULT_DRONE_POS: tuple[float, float, float] = (-19990.0, 0.0, 50.0)
+# Centred picket: the drone sits at the midpoint of the launch→target
+# corridor (missile spawns at x≈-20000, target at x=0), so the missile
+# closes from the west, passes beneath the drone (Doppler-notch crossing),
+# and recedes to the east — the classic intercept geometry.
+DEFAULT_DRONE_POS: tuple[float, float, float] = (-10000.0, 0.0, 50.0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -97,6 +102,7 @@ class RadarTimeline:
     v_radial_mps: np.ndarray  # radial velocity — signed (m/s)
     rcs_dbsm: np.ndarray      # Swerling-1 RCS per frame (dBsm)
     target_alt_m: np.ndarray  # target altitude per CPI frame (m)
+    downrange_m: np.ndarray   # signed along-track offset target−drone (m)
     n_frames: int
 
 
@@ -277,6 +283,11 @@ def build_radar_timeline(
     range_interp = np.interp(t_cpi, traj.t_s, traj.rel_range_m)
     vr_interp    = np.interp(t_cpi, traj.t_s, traj.rel_vr_mps)
     alt_interp   = np.interp(t_cpi, traj.t_s, traj.z_m)
+    # Signed along-track offset (target x − drone x): lets the viewer put
+    # the drone at the centre of the field and show the missile sweeping
+    # past (sign flips as it crosses the drone — the Doppler notch).
+    downrange_interp = np.interp(
+        t_cpi, traj.t_s, traj.x_m - traj.drone_pos[0])
 
     # Swerling RCS scintillation.
     rng = np.random.default_rng(seed)
@@ -298,6 +309,7 @@ def build_radar_timeline(
         v_radial_mps=vr_interp,
         rcs_dbsm=rcs_dbsm,
         target_alt_m=alt_interp,
+        downrange_m=downrange_interp,
         n_frames=n_frames,
     )
 
@@ -371,6 +383,139 @@ def compute_doppler_metadata(
 # ═══════════════════════════════════════════════════════════════════════════
 # 4. Frame-by-Frame RD Video Generation
 # ═══════════════════════════════════════════════════════════════════════════
+
+def integrate_trajectory(
+    traj_file: Path,
+    *,
+    drone_pos: tuple[float, float, float],
+    bistatic_angle_deg: float = DEFAULT_BISTATIC_ANGLE_DEG,
+    prf_hz: int = DEFAULT_PRF_HZ,
+    cpi_pulses: int = DEFAULT_CPI_PULSES,
+    n_range_bins: int = DEFAULT_N_RANGE_BINS,
+    cnr_db: float = DEFAULT_CNR_DB,
+    range_resolution_m: float = DEFAULT_RANGE_RES_M,
+    base_rcs_dbsm: float = DEFAULT_BASE_RCS_DBSM,
+    radar_params: "RadarSystemParams | None" = None,
+    swerling_model: int = 3,
+    run_seed: int | None = None,
+    progress: bool = False,
+) -> tuple[np.ndarray, list[dict[str, Any]], dict[str, Any]]:
+    """Integrate one trajectory file into an RD video for a given geometry.
+
+    This is the single source of truth for turning a kinematic trajectory
+    plus a drone position into a Range-Doppler video.  Both the batch
+    pipeline (:func:`generate_integrated_dataset`) and the interactive
+    visualizer call it, so changing the drone position / altitude here
+    re-runs the *real* radar geometry (range, Doppler, multipath, target
+    SNR) rather than just moving a marker.
+
+    Returns ``(rd_video, frame_metadata, radar_config)``.
+    """
+    if radar_params is None:
+        radar_params = RadarSystemParams(carrier_freq_ghz=77.0)
+
+    traj = parse_missile_trajectory(traj_file, drone_pos=drone_pos)
+    timeline = build_radar_timeline(
+        traj, prf_hz=prf_hz, cpi_pulses=cpi_pulses,
+        base_rcs_dbsm=base_rcs_dbsm, seed=run_seed, swerling_model=swerling_model,
+    )
+    n_frames = timeline.n_frames
+
+    rd_video = np.zeros((n_frames, n_range_bins, cpi_pulses), dtype=np.float32)
+    frame_metadata: list[dict[str, Any]] = []
+    rng = np.random.default_rng(
+        (run_seed + 1) if run_seed is not None else None)
+
+    # One model per trajectory so the Gamma texture evolves continuously
+    # across CPI frames (decorrelation ~3 s ≫ frame spacing).
+    model = BistaticClutterModel(
+        bistatic_angle_deg=bistatic_angle_deg, carrier_freq_ghz=77.0,
+        prf_hz=prf_hz, cpi_pulses=cpi_pulses, n_range_bins=n_range_bins,
+        cnr_db=cnr_db, seed=run_seed,
+    )
+    cpi_duration_s = cpi_pulses / prf_hz
+    window = np.hanning(cpi_pulses)
+
+    frame_iter = (trange(n_frames, desc=f"  {traj_file.stem}", leave=False)
+                  if progress else range(n_frames))
+    for f_idx in frame_iter:
+        r_m = float(timeline.range_m[f_idx])
+        v_r = float(timeline.v_radial_mps[f_idx])
+        rcs_db = float(timeline.rcs_dbsm[f_idx])
+        tgt_alt = float(timeline.target_alt_m[f_idx])
+
+        target_range_bin = int(r_m / range_resolution_m)
+        dop = compute_doppler_metadata(
+            velocity_mps=v_r, lam=LAMBDA_M, prf=prf_hz,
+            cpi=cpi_pulses, bistatic_deg=bistatic_angle_deg)
+        target_in_bounds = 0 <= target_range_bin < n_range_bins
+
+        clutter_v = model.generate_clutter_voltage(
+            dt_since_last_s=cpi_duration_s if f_idx > 0 else None)
+
+        multipath_factor_db = 0.0
+        if target_in_bounds:
+            clutter_v = embed_target_in_clutter(
+                clutter_map=clutter_v,
+                target_range_bin=target_range_bin,
+                target_doppler_hz=dop["doppler_hz_aliased"],
+                target_rcs_dbsm=rcs_db, noise_power=1.0, prf_hz=prf_hz,
+                target_absolute_range_m=r_m, drone_alt_m=drone_pos[2],
+                target_alt_m=tgt_alt, radar_params=radar_params,
+            )
+            _F = multipath_propagation_factor(
+                target_range_m=r_m, radar_alt_m=drone_pos[2],
+                target_alt_m=tgt_alt, lambda_m=LAMBDA_M)
+            multipath_factor_db = float(20.0 * np.log10(max(abs(_F), 1e-30)))
+
+        noise = (rng.standard_normal(clutter_v.shape)
+                 + 1j * rng.standard_normal(clutter_v.shape)) / np.sqrt(2.0)
+        spectrum = np.fft.fftshift(
+            np.fft.fft((clutter_v + noise) * window[np.newaxis, :], axis=1),
+            axes=1)
+        rd_video[f_idx, :, :] = (10.0 * np.log10(
+            np.maximum(np.abs(spectrum) ** 2, 1e-30))).astype(np.float32)
+
+        frame_metadata.append({
+            "frame": f_idx,
+            "t_s": float(timeline.t_cpi_s[f_idx]),
+            "range_m": r_m,
+            "snr_single_pulse_db": float(10.0 * np.log10(
+                max(radar_params.snr_single_pulse(rcs_db, r_m), 1e-30))),
+            "range_bin": target_range_bin if target_in_bounds else -1,
+            "velocity_mps": v_r,
+            "doppler_hz": dop["doppler_hz"],
+            "doppler_hz_aliased": dop["doppler_hz_aliased"],
+            "doppler_bin": dop["doppler_bin"],
+            "doppler_wraps": dop["doppler_wraps"],
+            "rcs_dbsm": rcs_db,
+            "target_alt_m": tgt_alt,
+            "downrange_m": float(timeline.downrange_m[f_idx]),
+            "multipath_factor_db": multipath_factor_db,
+            "target_in_bounds": target_in_bounds,
+        })
+
+    cos_half = math.cos(math.radians(bistatic_angle_deg / 2.0))
+    radar_config = {
+        "bistatic_angle_deg": bistatic_angle_deg,
+        "prf_hz": prf_hz, "cpi_pulses": cpi_pulses,
+        "n_range_bins": n_range_bins, "cnr_db": cnr_db,
+        "range_resolution_m": range_resolution_m, "carrier_freq_ghz": 77.0,
+        "lambda_m": LAMBDA_M, "base_rcs_dbsm": base_rcs_dbsm,
+        "drone_pos": list(drone_pos),
+        "doppler_bin_resolution_hz": prf_hz / cpi_pulses,
+        "max_unambiguous_velocity_mps": prf_hz * LAMBDA_M / (4.0 * cos_half),
+        "velocity_folding": True, "swerling_model": swerling_model,
+        "run_seed": run_seed,
+        "radar_peak_power_w": radar_params.peak_power_w,
+        "radar_tx_gain_db": radar_params.tx_gain_db,
+        "radar_rx_gain_db": radar_params.rx_gain_db,
+        "radar_noise_figure_db": radar_params.noise_figure_db,
+        "radar_system_loss_db": radar_params.system_loss_db,
+        "radar_bandwidth_hz": radar_params.bandwidth_hz,
+    }
+    return rd_video, frame_metadata, radar_config
+
 
 def generate_integrated_dataset(
     input_dir: str = "logs",
@@ -456,178 +601,21 @@ def generate_integrated_dataset(
         # Derive a recorded, reproducible seed for this trajectory.
         run_seed = int(seed_seq.spawn(1)[0].generate_state(1)[0])
 
-        # ── parse & resample ──────────────────────────────────────
-        traj = parse_missile_trajectory(traj_file, drone_pos=drone_pos)
-        timeline = build_radar_timeline(
-            traj,
-            prf_hz=prf_hz,
-            cpi_pulses=cpi_pulses,
-            base_rcs_dbsm=base_rcs_dbsm,
-            seed=run_seed,
-            swerling_model=swerling_model,
-        )
-
-        n_frames = timeline.n_frames
-        print(
-            f"  Trajectory: {traj.t_s[-1]:.2f}s, "
-            f"{len(traj.t_s)} kinematic steps → {n_frames} CPI frames"
-        )
-
-        # ── pre-allocate 3-D video array ──────────────────────────
-        rd_video = np.zeros(
-            (n_frames, n_range_bins, cpi_pulses), dtype=np.float32
-        )
-        frame_metadata: list[dict[str, Any]] = []
-
-        rng = np.random.default_rng(run_seed + 1)
-
-        # One model per trajectory: the Gamma texture must evolve
-        # continuously across CPI frames (decorrelation ~3 s, frames
-        # ~0.128 s apart), so the model carries texture state between
-        # frames instead of being re-created per frame.
-        model = BistaticClutterModel(
+        rd_video, frame_metadata, radar_config = integrate_trajectory(
+            traj_file,
+            drone_pos=drone_pos,
             bistatic_angle_deg=bistatic_angle_deg,
-            carrier_freq_ghz=77.0,
             prf_hz=prf_hz,
             cpi_pulses=cpi_pulses,
             n_range_bins=n_range_bins,
             cnr_db=cnr_db,
-            seed=run_seed,
+            range_resolution_m=range_resolution_m,
+            base_rcs_dbsm=base_rcs_dbsm,
+            radar_params=radar_params,
+            swerling_model=swerling_model,
+            run_seed=run_seed,
+            progress=True,
         )
-        cpi_duration_s = cpi_pulses / prf_hz
-
-        for f_idx in trange(n_frames, desc=f"  {stem}", leave=False):
-            r_m = float(timeline.range_m[f_idx])
-            v_r = float(timeline.v_radial_mps[f_idx])
-            rcs_db = float(timeline.rcs_dbsm[f_idx])
-            tgt_alt = float(timeline.target_alt_m[f_idx])
-
-            # Range bin for this frame.
-            target_range_bin = int(r_m / range_resolution_m)
-
-            # Doppler metadata (aliasing-aware, sign-preserving).
-            dop = compute_doppler_metadata(
-                velocity_mps=v_r,
-                lam=LAMBDA_M,
-                prf=prf_hz,
-                cpi=cpi_pulses,
-                bistatic_deg=bistatic_angle_deg,
-            )
-            doppler_hz = dop["doppler_hz"]
-            doppler_hz_aliased = dop["doppler_hz_aliased"]
-            doppler_bin = dop["doppler_bin"]
-            doppler_wraps = dop["doppler_wraps"]
-
-            # Track whether the target is in bounds.
-            target_in_bounds = 0 <= target_range_bin < n_range_bins
-
-            # ── generate clutter + target ─────────────────────────
-            # First frame draws a fresh texture; subsequent frames
-            # evolve it forward by one CPI duration.
-            clutter_v = model.generate_clutter_voltage(
-                dt_since_last_s=cpi_duration_s if f_idx > 0 else None
-            )
-
-            # Multipath propagation factor (Generalized Target model).
-            # drone_pos[2] is the radar drone altitude; tgt_alt is the
-            # interpolated missile altitude for this CPI frame.
-            multipath_factor_db = 0.0
-            if target_in_bounds:
-                # Use the aliased Doppler for injection — this is what
-                # the RD map FFT actually resolves.
-                clutter_v = embed_target_in_clutter(
-                    clutter_map=clutter_v,
-                    target_range_bin=target_range_bin,
-                    target_doppler_hz=doppler_hz_aliased,
-                    target_rcs_dbsm=rcs_db,
-                    noise_power=1.0,
-                    prf_hz=prf_hz,
-                    target_absolute_range_m=r_m,
-                    drone_alt_m=drone_pos[2],
-                    target_alt_m=tgt_alt,
-                    radar_params=radar_params,
-                )
-
-                # Log the multipath factor magnitude for diagnostics.
-                _F = multipath_propagation_factor(
-                    target_range_m=r_m,
-                    radar_alt_m=drone_pos[2],
-                    target_alt_m=tgt_alt,
-                    lambda_m=LAMBDA_M,
-                )
-                multipath_factor_db = float(
-                    20.0 * np.log10(max(abs(_F), 1e-30))
-                )
-
-            # Thermal noise.
-            noise = (
-                rng.standard_normal(clutter_v.shape)
-                + 1j * rng.standard_normal(clutter_v.shape)
-            ) / np.sqrt(2.0)
-            signal = clutter_v + noise
-
-            # Hanning window → FFT → fftshift → power (dB).
-            window = np.hanning(cpi_pulses)
-            spectrum = np.fft.fftshift(
-                np.fft.fft(signal * window[np.newaxis, :], axis=1),
-                axes=1,
-            )
-            power_db = 10.0 * np.log10(
-                np.maximum(np.abs(spectrum) ** 2, 1e-30)
-            )
-
-            rd_video[f_idx, :, :] = power_db.astype(np.float32)
-
-            snr_single_pulse_db = float(
-                10.0 * np.log10(
-                    max(radar_params.snr_single_pulse(rcs_db, r_m), 1e-30)
-                )
-            )
-
-            frame_metadata.append({
-                "frame": f_idx,
-                "t_s": float(timeline.t_cpi_s[f_idx]),
-                "range_m": r_m,
-                "snr_single_pulse_db": snr_single_pulse_db,
-                "range_bin": target_range_bin if target_in_bounds else -1,
-                "velocity_mps": v_r,
-                "doppler_hz": doppler_hz,
-                "doppler_hz_aliased": doppler_hz_aliased,
-                "doppler_bin": doppler_bin,
-                "doppler_wraps": doppler_wraps,
-                "rcs_dbsm": rcs_db,
-                "target_alt_m": tgt_alt,
-                "multipath_factor_db": multipath_factor_db,
-                "target_in_bounds": target_in_bounds,
-            })
-
-        # ── serialise ─────────────────────────────────────────────
-        cos_half = math.cos(math.radians(bistatic_angle_deg / 2.0))
-        radar_config = {
-            "bistatic_angle_deg": bistatic_angle_deg,
-            "prf_hz": prf_hz,
-            "cpi_pulses": cpi_pulses,
-            "n_range_bins": n_range_bins,
-            "cnr_db": cnr_db,
-            "range_resolution_m": range_resolution_m,
-            "carrier_freq_ghz": 77.0,
-            "lambda_m": LAMBDA_M,
-            "base_rcs_dbsm": base_rcs_dbsm,
-            "drone_pos": list(drone_pos),
-            "doppler_bin_resolution_hz": prf_hz / cpi_pulses,
-            "max_unambiguous_velocity_mps": (
-                prf_hz * LAMBDA_M / (4.0 * cos_half)
-            ),
-            "velocity_folding": True,
-            "swerling_model": swerling_model,
-            "run_seed": run_seed,
-            "radar_peak_power_w": radar_params.peak_power_w,
-            "radar_tx_gain_db": radar_params.tx_gain_db,
-            "radar_rx_gain_db": radar_params.rx_gain_db,
-            "radar_noise_figure_db": radar_params.noise_figure_db,
-            "radar_system_loss_db": radar_params.system_loss_db,
-            "radar_bandwidth_hz": radar_params.bandwidth_hz,
-        }
 
         out_file = out_path / f"{stem}.npz"
         np.savez_compressed(
@@ -641,7 +629,7 @@ def generate_integrated_dataset(
         in_bounds = sum(1 for m in frame_metadata if m["target_in_bounds"])
         print(
             f"  Saved: {out_file.name}  "
-            f"({n_frames} frames, {in_bounds} with target in bounds)"
+            f"({len(frame_metadata)} frames, {in_bounds} with target in bounds)"
         )
 
     # ── summary ───────────────────────────────────────────────────
@@ -685,8 +673,9 @@ def _parse_args() -> argparse.Namespace:
         help="CPI pulses (default 128).",
     )
     p.add_argument(
-        "--drone_pos", type=str, default="-19990,0,50",
-        help="Drone (x,y,z) position as comma-separated floats (default -19990,0,50).",
+        "--drone_pos", type=str, default="-10000,0,50",
+        help="Drone (x,y,z) position as comma-separated floats "
+             "(default -10000,0,50 — centred picket).",
     )
     p.add_argument(
         "--range_bins", type=int, default=DEFAULT_N_RANGE_BINS,
